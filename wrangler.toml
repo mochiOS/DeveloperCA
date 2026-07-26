@@ -3,7 +3,7 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2026-07-26"
 
 [build]
-command = "worker-build --release"
+command = "worker-build --release --no-panic-recovery"
 
 [vars]
 ACCOUNTS_BASE_URL = "http://localhost:8787"
