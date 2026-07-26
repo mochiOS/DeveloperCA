@@ -13,5 +13,5 @@ ISSUER_KEY_ID = "development-intermediate-1"
 [[d1_databases]]
 binding = "DB"
 database_name = "mochios-developer-ca"
-database_id = "replace-with-production-database-id"
+database_id = "4cea84e3-6120-4a62-983a-8af796a899ea"
 migrations_dir = "migrations"
