@@ -1,0 +1,17 @@
+name = "mochios-developer-ca"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-07-26"
+
+[build]
+command = "worker-build --release"
+
+[vars]
+ACCOUNTS_BASE_URL = "http://localhost:8787"
+CERTIFICATE_TTL_SECONDS = "31536000"
+ISSUER_KEY_ID = "development-intermediate-1"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mochios-developer-ca"
+database_id = "replace-with-production-database-id"
+migrations_dir = "migrations"

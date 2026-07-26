@@ -1,0 +1,15 @@
+# Developerモデル
+
+AccountはAccountsが管理する人間の認証主体です。Developerは公開者・署名主体、
+Developer MemberはAccountとDeveloperの所属関係です。
+
+roleはowner、admin、developer、viewer、membership状態はactive、invited、
+suspended、removedです。Developerの利用状態と審査状態は別々の列へ保存します。
+
+Developer作成と作成者のowner membershipは同じD1 batchで作成します。DB trigger
+により最後のactive ownerを削除できません。
+
+Accountが通常所有できるactive Developerは1つです。2つ目以降は、申請内容と
+一致するapprovedかつ未使用の追加作成申請が必要で、作成時に同じtransactionで
+consumedへ変更します。他Developerへのmember参加数は所有数へ含めません。
+
