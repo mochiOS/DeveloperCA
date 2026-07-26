@@ -1,5 +1,5 @@
 use serde::de::DeserializeOwned;
-use uuid::Uuid;
+use uuid::{NoContext, Timestamp, Uuid};
 use worker::{D1Database, Result, wasm_bindgen::JsValue};
 
 use crate::certificate::CertificateRequestInput;
@@ -16,8 +16,9 @@ fn number(value: i64) -> JsValue {
 fn nullable(value_: Option<&str>) -> JsValue {
     value_.map(value).unwrap_or(JsValue::NULL)
 }
-pub fn id() -> String {
-    Uuid::now_v7().to_string()
+pub fn id(now: i64) -> String {
+    let timestamp = Timestamp::from_unix(NoContext, now.max(0) as u64, 0);
+    Uuid::new_v7(timestamp).to_string()
 }
 
 fn audit(
@@ -28,7 +29,7 @@ fn audit(
     now: i64,
 ) -> Result<worker::D1PreparedStatement> {
     db.prepare("INSERT INTO audit_logs (id, developer_id, actor_account_id, event_type, metadata_json, created_at) VALUES (?1, ?2, ?3, ?4, '{}', ?5)")
-        .bind(&[value(id()), nullable(developer_id), nullable(actor), value(event), number(now)])
+        .bind(&[value(id(now)), nullable(developer_id), nullable(actor), value(event), number(now)])
 }
 
 async fn all<T: DeserializeOwned>(statement: worker::D1PreparedStatement) -> Result<Vec<T>> {
@@ -67,7 +68,7 @@ pub async fn create_developer(
     request_id: Option<&str>,
     now: i64,
 ) -> Result<Option<Developer>> {
-    let developer_id = id();
+    let developer_id = id(now);
     let request = nullable(request_id);
     db.batch(vec![
         db.prepare(
@@ -84,7 +85,7 @@ pub async fn create_developer(
         db.prepare(
             "INSERT INTO developer_members (id, developer_id, account_id, role, status, created_at, updated_at)
              SELECT ?1, ?2, ?3, 'owner', 'active', ?4, ?4 FROM developers WHERE id=?2",
-        ).bind(&[value(id()), value(&developer_id), value(account_id), number(now)])?,
+        ).bind(&[value(id(now)), value(&developer_id), value(account_id), number(now)])?,
         db.prepare(
             "UPDATE developer_creation_requests SET status='consumed', updated_at=?1
              WHERE id=?2 AND account_id=?3 AND status='approved' AND EXISTS (SELECT 1 FROM developers WHERE id=?4)",
@@ -92,7 +93,7 @@ pub async fn create_developer(
         db.prepare(
             "INSERT INTO audit_logs (id, developer_id, actor_account_id, event_type, metadata_json, created_at)
              SELECT ?1, ?2, ?3, 'developer.created', '{}', ?4 FROM developers WHERE id=?2",
-        ).bind(&[value(id()), value(&developer_id), value(account_id), number(now)])?,
+        ).bind(&[value(id(now)), value(&developer_id), value(account_id), number(now)])?,
     ]).await?;
     developer(db, &developer_id).await
 }
@@ -112,7 +113,7 @@ pub async fn add_member(
     now: i64,
     actor: &str,
 ) -> Result<Option<Member>> {
-    let member_id = id();
+    let member_id = id(now);
     db.batch(vec![
         db.prepare(
             "INSERT INTO developer_members (id, developer_id, account_id, role, status, created_at, updated_at)
@@ -167,7 +168,7 @@ pub async fn create_creation_request(
     reason: &str,
     now: i64,
 ) -> Result<CreationRequest> {
-    let request_id = id();
+    let request_id = id(now);
     db.prepare(
         "INSERT INTO developer_creation_requests
          (id, account_id, requested_display_name, requested_developer_type, reason, status, created_at, updated_at)
@@ -243,7 +244,7 @@ pub async fn create_certificate_request(
     input: &CertificateRequestInput,
     now: i64,
 ) -> Result<CertificateRequestRow> {
-    let request_id = id();
+    let request_id = id(now);
     let subject_key_id = input.subject_key_id().map_err(worker::Error::RustError)?;
     db.batch(vec![
         db.prepare(
@@ -261,7 +262,7 @@ pub async fn create_certificate_request(
             "INSERT INTO audit_logs (id, developer_id, actor_account_id, event_type, metadata_json, created_at)
              SELECT ?1, ?2, ?3, 'certificate_request.created', '{}', ?4
              FROM certificate_requests WHERE id=?5",
-        ).bind(&[value(id()), value(developer_id), value(account_id), number(now), value(&request_id)])?,
+        ).bind(&[value(id(now)), value(developer_id), value(account_id), number(now), value(&request_id)])?,
     ]).await?;
     certificate_request(db, &request_id)
         .await?
@@ -364,7 +365,7 @@ pub async fn revoke_certificate(
             "INSERT INTO revocations (id, certificate_id, serial_number, reason, revoked_by_account_id, revoked_at)
              SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE EXISTS (SELECT 1 FROM certificates WHERE id=?2 AND status='revoked')
              ON CONFLICT(certificate_id) DO NOTHING",
-        ).bind(&[value(id()), value(certificate_id), value(&cert.serial_number), value(reason), value(actor), number(now)])?,
+        ).bind(&[value(id(now)), value(certificate_id), value(&cert.serial_number), value(reason), value(actor), number(now)])?,
         audit(db, Some(&cert.developer_id), Some(actor), "certificate.revoked", now)?,
     ]).await?;
     certificate(db, certificate_id).await
@@ -374,4 +375,15 @@ pub async fn revocations(db: &D1Database) -> Result<Vec<Revocation>> {
     all(db.prepare(
         "SELECT id, certificate_id, serial_number, reason, revoked_by_account_id, revoked_at FROM revocations ORDER BY revoked_at",
     )).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_ids_are_uuid_v7_without_system_clock_access() {
+        let parsed = Uuid::parse_str(&id(1_700_000_000)).unwrap();
+        assert_eq!(parsed.get_version_num(), 7);
+    }
 }

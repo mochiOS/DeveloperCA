@@ -487,8 +487,8 @@ async fn admin_issue(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let certificate_id = store::id();
     let issued_at = now();
+    let certificate_id = store::id(issued_at);
     let ttl = ctx
         .env
         .var("CERTIFICATE_TTL_SECONDS")?

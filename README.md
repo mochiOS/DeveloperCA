@@ -21,6 +21,7 @@ npx wrangler dev
 
 ```text
 SERVICE_TOKEN=<Accountsと共有するランダム値>
+CONSOLE_SERVICE_TOKEN=<Consoleとのサービス間認証専用のランダム値>
 ADMIN_TOKEN=<管理API専用のランダム値>
 INTERMEDIATE_PRIVATE_KEY=<base64形式の32 byte Ed25519 seed>
 ```
@@ -34,4 +35,3 @@ Offline Root秘密鍵をこのWorkerへ配置してはいけません。
 cargo test --lib
 cargo clippy --target wasm32-unknown-unknown -- -D warnings
 ```
-

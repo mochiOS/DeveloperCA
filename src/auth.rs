@@ -32,13 +32,14 @@ fn service_headers(env: &worker::Env) -> Result<Headers> {
 
 pub async fn account(req: &Request, env: &worker::Env) -> Result<Option<String>> {
     let authorization = req.headers().get("Authorization")?.unwrap_or_default();
-    let Some(token) = authorization
+    let token = authorization
         .strip_prefix("Bearer ")
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
+        .filter(|value| !value.is_empty());
+    if token.is_none() {
+        return console_account(req, env).await;
+    }
+    let token = token.unwrap_or_default();
     let base = env.var("ACCOUNTS_BASE_URL")?.to_string();
     let headers = service_headers(env)?;
     headers.set("Content-Type", "application/json")?;
@@ -68,6 +69,21 @@ pub async fn account(req: &Request, env: &worker::Env) -> Result<Option<String>>
             .then_some(result.account_id)
             .flatten(),
     )
+}
+
+async fn console_account(req: &Request, env: &worker::Env) -> Result<Option<String>> {
+    let expected = env.secret("CONSOLE_SERVICE_TOKEN")?.to_string();
+    let provided = req
+        .headers()
+        .get("X-Console-Service-Token")?
+        .unwrap_or_default();
+    let account_id = req.headers().get("X-Account-ID")?.unwrap_or_default();
+    if expected.is_empty() || account_id.is_empty() || !constant_time_eq(&expected, &provided) {
+        return Ok(None);
+    }
+    Ok(account_is_active(&account_id, env)
+        .await?
+        .then_some(account_id))
 }
 
 pub async fn account_is_active(account_id: &str, env: &worker::Env) -> Result<bool> {
