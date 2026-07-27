@@ -4,8 +4,7 @@ use worker::{D1Database, Result, wasm_bindgen::JsValue};
 
 use crate::certificate::CertificateRequestInput;
 use crate::model::{
-    CapabilityGrant, CertificateRequestRow, CertificateReviewRequest, CertificateRow,
-    CreationRequest, Developer, GlobalCapability, IssuerRow, Member, PackageScopeGrant, Revocation,
+    CertificateRow, CreationRequest, Developer, IssuerRow, Member, Revocation,
     RevocationSnapshotRow, TrustSnapshotRow,
 };
 
@@ -323,143 +322,68 @@ pub async fn suspend_developer(
     developer(db, developer_id).await
 }
 
-pub async fn create_certificate_request(
-    db: &D1Database,
-    developer_id: &str,
-    account_id: &str,
-    input: &CertificateRequestInput,
-    now: i64,
-) -> Result<CertificateRequestRow> {
-    let request_id = id(now);
-    let subject_key_id = input.subject_key_id().map_err(worker::Error::RustError)?;
-    db.batch(vec![
-        db.prepare(
-            "INSERT INTO certificate_requests
-             (id, developer_id, requested_by_account_id, signature_algorithm, subject_public_key, subject_key_id,
-              package_id_scopes_json, allowed_capabilities_json, status, created_at, updated_at)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?9
-             FROM developers WHERE id=?2 AND status='active' AND verification_status='verified'",
-        ).bind(&[
-            value(&request_id), value(developer_id), value(account_id), value(&input.signature_algorithm),
-            value(&input.subject_public_key), value(&subject_key_id),
-            value(serde_json::to_string(&input.package_id_scopes)?), value(serde_json::to_string(&input.allowed_capabilities)?), number(now),
-        ])?,
-        db.prepare(
-            "INSERT INTO audit_logs (id, developer_id, actor_account_id, event_type, metadata_json, created_at)
-             SELECT ?1, ?2, ?3, 'certificate_request.created', '{}', ?4
-             FROM certificate_requests WHERE id=?5",
-        ).bind(&[value(id(now)), value(developer_id), value(account_id), number(now), value(&request_id)])?,
-    ]).await?;
-    certificate_request(db, &request_id)
-        .await?
-        .ok_or_else(|| "developer is not eligible for certificate issuance".into())
-}
-
-pub async fn certificate_request(
-    db: &D1Database,
-    request_id: &str,
-) -> Result<Option<CertificateRequestRow>> {
-    db.prepare(
-        "SELECT id, developer_id, requested_by_account_id, signature_algorithm, subject_public_key, subject_key_id,
-         package_id_scopes_json, allowed_capabilities_json, status, created_at, updated_at
-         FROM certificate_requests WHERE id=?1",
-    ).bind(&[value(request_id)])?.first(None).await
-}
-
-pub async fn pending_certificate_reviews(db: &D1Database) -> Result<Vec<CertificateReviewRequest>> {
-    all(db.prepare(
-        "SELECT r.id, r.developer_id, d.display_name AS developer_display_name,
-         r.requested_by_account_id, r.signature_algorithm, r.subject_key_id,
-         r.package_id_scopes_json, r.allowed_capabilities_json, r.status, r.created_at, r.updated_at
-         FROM certificate_requests r JOIN developers d ON d.id=r.developer_id
-         WHERE r.status='pending' ORDER BY r.created_at",
-    ))
-    .await
-}
-
 pub struct IssuedCertificateRecord<'a> {
+    pub request_id: &'a str,
     pub certificate_id: &'a str,
     pub serial: &'a str,
     pub issuer: &'a str,
     pub certificate_json: &'a str,
     pub not_before: i64,
     pub not_after: i64,
-    pub actor: &'a str,
     pub now: i64,
 }
 
 pub async fn issue_certificate(
     db: &D1Database,
-    request: &CertificateRequestRow,
+    developer_id: &str,
+    account_id: &str,
+    input: &CertificateRequestInput,
     issued: IssuedCertificateRecord<'_>,
 ) -> Result<Option<CertificateRow>> {
+    let subject_key_id = input.subject_key_id().map_err(worker::Error::RustError)?;
     db.batch(vec![
+        db.prepare(
+            "INSERT INTO certificate_requests
+             (id, developer_id, requested_by_account_id, signature_algorithm, subject_public_key,
+              subject_key_id, package_id_scopes_json, allowed_capabilities_json, status,
+              processed_by_account_id, processed_at, created_at, updated_at)
+             SELECT ?1, developer.id, ?2, ?3, ?4, ?5, ?6, ?7, 'issued', ?2, ?8, ?8, ?8
+             FROM developers developer
+             JOIN developer_members member ON member.developer_id=developer.id
+             WHERE developer.id=?9 AND developer.status='active'
+               AND developer.verification_status='verified' AND member.account_id=?2
+               AND member.status='active' AND member.role IN ('owner', 'admin', 'developer')",
+        ).bind(&[
+            value(issued.request_id), value(account_id), value(&input.signature_algorithm),
+            value(&input.subject_public_key), value(&subject_key_id),
+            value(serde_json::to_string(&input.package_id_scopes)?),
+            value(serde_json::to_string(&input.allowed_capabilities)?), number(issued.now),
+            value(developer_id),
+        ])?,
         db.prepare(
             "INSERT INTO certificates
              (id, certificate_request_id, developer_id, serial_number, issuer_key_id, subject_key_id,
               certificate_json, not_before, not_after, status, created_at)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10
-             WHERE EXISTS (SELECT 1 FROM certificate_requests WHERE id=?2 AND status='pending')
-             AND EXISTS (SELECT 1 FROM developers WHERE id=?3 AND status='active' AND verification_status='verified')
-             AND EXISTS (
-               SELECT 1 FROM certificate_requests request
-               JOIN developer_members member
-                 ON member.developer_id=request.developer_id
-                AND member.account_id=request.requested_by_account_id
-               WHERE request.id=?2 AND member.status='active'
-                 AND member.role IN ('owner', 'admin', 'developer')
-             )
-             AND NOT EXISTS (
-               SELECT 1 FROM certificate_requests request, json_each(request.package_id_scopes_json) requested
-               WHERE request.id=?2 AND NOT EXISTS (
-                 SELECT 1 FROM developer_package_scopes grant_scope
-                 WHERE grant_scope.developer_id=request.developer_id
-                   AND grant_scope.scope=requested.value AND grant_scope.status='active'
-               )
-             )
-             AND NOT EXISTS (
-               SELECT 1 FROM certificate_requests request, json_each(request.allowed_capabilities_json) requested
-               WHERE request.id=?2 AND (
-                 NOT EXISTS (
-                   SELECT 1 FROM developer_capability_grants grant_capability
-                   WHERE grant_capability.developer_id=request.developer_id
-                     AND grant_capability.capability=requested.value
-                     AND grant_capability.status='active'
-                 ) OR NOT EXISTS (
-                   SELECT 1 FROM global_issuable_capabilities global_capability
-                   WHERE global_capability.capability=requested.value
-                     AND global_capability.status='active'
-                 )
-               )
-             )",
+             SELECT ?1, request.id, request.developer_id, ?2, ?3, request.subject_key_id,
+                    ?4, ?5, ?6, 'active', ?7
+             FROM certificate_requests request
+             WHERE request.id=?8 AND request.status='issued'
+               AND request.requested_by_account_id=?9",
         ).bind(&[
-            value(issued.certificate_id), value(&request.id), value(&request.developer_id), value(issued.serial), value(issued.issuer),
-            value(&request.subject_key_id), value(issued.certificate_json), number(issued.not_before), number(issued.not_after), number(issued.now),
+            value(issued.certificate_id), value(issued.serial), value(issued.issuer),
+            value(issued.certificate_json), number(issued.not_before), number(issued.not_after),
+            number(issued.now), value(issued.request_id), value(account_id),
         ])?,
         db.prepare(
-            "UPDATE certificate_requests SET status='issued', processed_by_account_id=?1, processed_at=?2, updated_at=?2
-             WHERE id=?3 AND status='pending' AND EXISTS (SELECT 1 FROM certificates WHERE id=?4)",
-        ).bind(&[value(issued.actor), number(issued.now), value(&request.id), value(issued.certificate_id)])?,
-        audit(db, Some(&request.developer_id), Some(issued.actor), "certificate.issued", issued.now)?,
+            "INSERT INTO audit_logs (id, developer_id, actor_account_id, event_type, metadata_json, created_at)
+             SELECT ?1, ?2, ?3, 'certificate.issued', '{}', ?4
+             FROM certificates WHERE id=?5",
+        ).bind(&[
+            value(id(issued.now)), value(developer_id), value(account_id), number(issued.now),
+            value(issued.certificate_id),
+        ])?,
     ]).await?;
     certificate(db, issued.certificate_id).await
-}
-
-pub async fn reject_certificate_request(
-    db: &D1Database,
-    request_id: &str,
-    actor: &str,
-    reason: Option<&str>,
-    now: i64,
-) -> Result<Option<CertificateRequestRow>> {
-    db.batch(vec![
-        db.prepare(
-            "UPDATE certificate_requests SET status='rejected', processed_by_account_id=?1, processed_at=?2,
-             rejection_reason=?3, updated_at=?2 WHERE id=?4 AND status='pending'",
-        ).bind(&[value(actor), number(now), nullable(reason), value(request_id)])?,
-        audit(db, None, Some(actor), "certificate_request.rejected", now)?,
-    ]).await?;
-    certificate_request(db, request_id).await
 }
 
 pub async fn certificate(db: &D1Database, certificate_id: &str) -> Result<Option<CertificateRow>> {
@@ -474,6 +398,15 @@ pub async fn list_certificates(db: &D1Database, developer_id: &str) -> Result<Ve
         "SELECT id, certificate_request_id, developer_id, serial_number, issuer_key_id, subject_key_id,
          certificate_json, not_before, not_after, status, created_at FROM certificates WHERE developer_id=?1 ORDER BY created_at DESC",
     ).bind(&[value(developer_id)])?).await
+}
+
+pub async fn active_certificates(db: &D1Database) -> Result<Vec<CertificateRow>> {
+    all(db.prepare(
+        "SELECT id, certificate_request_id, developer_id, serial_number, issuer_key_id, subject_key_id,
+         certificate_json, not_before, not_after, status, created_at FROM certificates
+         WHERE status='active' ORDER BY created_at DESC LIMIT 100",
+    ))
+    .await
 }
 
 pub struct RevocationSnapshotRecord<'a> {
@@ -573,228 +506,6 @@ pub async fn save_revocation_snapshot(
     ])
     .await?;
     Ok(())
-}
-
-pub async fn package_scope_grants(
-    db: &D1Database,
-    developer_id: &str,
-) -> Result<Vec<PackageScopeGrant>> {
-    all(db
-        .prepare(
-            "SELECT id, developer_id, scope, status, granted_by_account_id, created_at, revoked_at
-             FROM developer_package_scopes WHERE developer_id=?1 ORDER BY scope",
-        )
-        .bind(&[value(developer_id)])?)
-    .await
-}
-
-pub async fn capability_grants(
-    db: &D1Database,
-    developer_id: &str,
-) -> Result<Vec<CapabilityGrant>> {
-    all(db
-        .prepare(
-            "SELECT id, developer_id, capability, status, granted_by_account_id, created_at,
-             revoked_at FROM developer_capability_grants WHERE developer_id=?1 ORDER BY capability",
-        )
-        .bind(&[value(developer_id)])?)
-    .await
-}
-
-pub async fn global_capabilities(db: &D1Database) -> Result<Vec<GlobalCapability>> {
-    all(db.prepare(
-        "SELECT capability, status, created_at, updated_at
-         FROM global_issuable_capabilities ORDER BY capability",
-    ))
-    .await
-}
-
-pub async fn grant_package_scope(
-    db: &D1Database,
-    developer_id: &str,
-    scope: &str,
-    actor: &str,
-    now: i64,
-) -> Result<Option<PackageScopeGrant>> {
-    let grant_id = id(now);
-    db.batch(vec![
-        db.prepare(
-            "INSERT INTO developer_package_scopes
-             (id, developer_id, scope, status, granted_by_account_id, created_at, revoked_at)
-             SELECT ?1, ?2, ?3, 'active', ?4, ?5, NULL
-             WHERE EXISTS (SELECT 1 FROM developers WHERE id=?2)
-             ON CONFLICT(developer_id, scope) DO UPDATE SET status='active',
-             granted_by_account_id=excluded.granted_by_account_id,
-             created_at=excluded.created_at, revoked_at=NULL",
-        )
-        .bind(&[
-            value(&grant_id),
-            value(developer_id),
-            value(scope),
-            value(actor),
-            number(now),
-        ])?,
-        audit(
-            db,
-            Some(developer_id),
-            Some(actor),
-            "policy.package_scope.granted",
-            now,
-        )?,
-    ])
-    .await?;
-    db.prepare(
-        "SELECT id, developer_id, scope, status, granted_by_account_id, created_at, revoked_at
-         FROM developer_package_scopes WHERE developer_id=?1 AND scope=?2",
-    )
-    .bind(&[value(developer_id), value(scope)])?
-    .first(None)
-    .await
-}
-
-pub async fn revoke_package_scope(
-    db: &D1Database,
-    developer_id: &str,
-    grant_id: &str,
-    actor: &str,
-    now: i64,
-) -> Result<bool> {
-    let result = db
-        .prepare(
-            "UPDATE developer_package_scopes SET status='revoked', revoked_at=?1
-             WHERE id=?2 AND developer_id=?3 AND status='active'",
-        )
-        .bind(&[number(now), value(grant_id), value(developer_id)])?
-        .run()
-        .await?;
-    let changed = result
-        .meta()?
-        .and_then(|metadata| metadata.changes)
-        .is_some_and(|changes| changes == 1);
-    if changed {
-        audit(
-            db,
-            Some(developer_id),
-            Some(actor),
-            "policy.package_scope.revoked",
-            now,
-        )?
-        .run()
-        .await?;
-    }
-    Ok(changed)
-}
-
-pub async fn grant_capability(
-    db: &D1Database,
-    developer_id: &str,
-    capability: &str,
-    actor: &str,
-    now: i64,
-) -> Result<Option<CapabilityGrant>> {
-    let grant_id = id(now);
-    db.batch(vec![
-        db.prepare(
-            "INSERT INTO developer_capability_grants
-             (id, developer_id, capability, status, granted_by_account_id, created_at, revoked_at)
-             SELECT ?1, ?2, ?3, 'active', ?4, ?5, NULL
-             WHERE EXISTS (SELECT 1 FROM developers WHERE id=?2)
-             ON CONFLICT(developer_id, capability) DO UPDATE SET status='active',
-             granted_by_account_id=excluded.granted_by_account_id,
-             created_at=excluded.created_at, revoked_at=NULL",
-        )
-        .bind(&[
-            value(&grant_id),
-            value(developer_id),
-            value(capability),
-            value(actor),
-            number(now),
-        ])?,
-        audit(
-            db,
-            Some(developer_id),
-            Some(actor),
-            "policy.capability.granted",
-            now,
-        )?,
-    ])
-    .await?;
-    db.prepare(
-        "SELECT id, developer_id, capability, status, granted_by_account_id, created_at, revoked_at
-         FROM developer_capability_grants WHERE developer_id=?1 AND capability=?2",
-    )
-    .bind(&[value(developer_id), value(capability)])?
-    .first(None)
-    .await
-}
-
-pub async fn revoke_capability(
-    db: &D1Database,
-    developer_id: &str,
-    grant_id: &str,
-    actor: &str,
-    now: i64,
-) -> Result<bool> {
-    let result = db
-        .prepare(
-            "UPDATE developer_capability_grants SET status='revoked', revoked_at=?1
-             WHERE id=?2 AND developer_id=?3 AND status='active'",
-        )
-        .bind(&[number(now), value(grant_id), value(developer_id)])?
-        .run()
-        .await?;
-    let changed = result
-        .meta()?
-        .and_then(|metadata| metadata.changes)
-        .is_some_and(|changes| changes == 1);
-    if changed {
-        audit(
-            db,
-            Some(developer_id),
-            Some(actor),
-            "policy.capability.revoked",
-            now,
-        )?
-        .run()
-        .await?;
-    }
-    Ok(changed)
-}
-
-pub async fn set_global_capability(
-    db: &D1Database,
-    capability: &str,
-    status: &str,
-    actor: &str,
-    now: i64,
-) -> Result<Option<GlobalCapability>> {
-    db.batch(vec![
-        db.prepare(
-            "INSERT INTO global_issuable_capabilities (capability, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?3)
-             ON CONFLICT(capability) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at",
-        )
-        .bind(&[value(capability), value(status), number(now)])?,
-        audit(
-            db,
-            None,
-            Some(actor),
-            if status == "active" {
-                "policy.global_capability.enabled"
-            } else {
-                "policy.global_capability.disabled"
-            },
-            now,
-        )?,
-    ])
-    .await?;
-    db.prepare(
-        "SELECT capability, status, created_at, updated_at
-         FROM global_issuable_capabilities WHERE capability=?1",
-    )
-    .bind(&[value(capability)])?
-    .first(None)
-    .await
 }
 
 pub async fn issuers(db: &D1Database) -> Result<Vec<IssuerRow>> {

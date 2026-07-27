@@ -2,6 +2,8 @@ use rusqlite::{Connection, params};
 
 const INITIAL: &str = include_str!("../migrations/0001_developer_ca.sql");
 const TRUST: &str = include_str!("../migrations/0002_trust_issuers_policy.sql");
+const AUTOMATIC_ISSUANCE: &str =
+    include_str!("../migrations/0003_automatic_certificate_issuance.sql");
 
 fn existing_database() -> Connection {
     let connection = Connection::open_in_memory().expect("open fixture database");
@@ -30,6 +32,17 @@ fn existing_database() -> Connection {
         .expect("insert request");
     connection
         .execute(
+            "INSERT INTO certificate_requests
+             (id, developer_id, requested_by_account_id, signature_algorithm,
+              subject_public_key, subject_key_id, package_id_scopes_json,
+              allowed_capabilities_json, status, created_at, updated_at)
+             VALUES ('request-pending', 'developer-1', 'account-1', 'ed25519', 'public',
+                     'subject-pending', '[\"org.mochios.pending\"]', '[]', 'pending', 2, 2)",
+            [],
+        )
+        .expect("insert pending request");
+    connection
+        .execute(
             "INSERT INTO certificates VALUES
              ('certificate-1', 'request-1', 'developer-1', '42', 'issuer-1', 'subject',
               'wire', 1, 100, 'revoked', 1)",
@@ -51,6 +64,58 @@ fn existing_database() -> Connection {
         )
         .expect("insert audit");
     connection
+}
+
+#[test]
+fn automatic_issuance_migration_closes_legacy_reviews_and_removes_policy_tables() {
+    let connection = existing_database();
+    connection
+        .execute_batch(TRUST)
+        .expect("apply trust migration");
+    connection
+        .execute_batch(AUTOMATIC_ISSUANCE)
+        .expect("apply automatic issuance migration");
+
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status FROM certificate_requests WHERE id='request-pending'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("pending request status"),
+        "rejected"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM certificates", [], |row| row
+                .get::<_, i64>(0))
+            .expect("certificate count"),
+        1
+    );
+    for table in [
+        "developer_package_scopes",
+        "developer_capability_grants",
+        "global_issuable_capabilities",
+    ] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("table lookup"),
+            0,
+            "obsolete table remains: {table}"
+        );
+    }
+    assert_eq!(
+        connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .expect("integrity check"),
+        "ok"
+    );
 }
 
 #[test]

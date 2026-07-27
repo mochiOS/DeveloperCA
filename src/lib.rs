@@ -3,8 +3,6 @@ pub mod certificate;
 mod model;
 mod store;
 
-use std::collections::HashSet;
-
 use mochios_developer_ca_trust::{
     IssuerStatus, MAX_SNAPSHOT_BYTES, REVOCATION_FORMAT_VERSION, RevocationReasonCode,
     RevocationSnapshot as SignedRevocationSnapshot, SIGNATURE_ALGORITHM, SnapshotRevocation,
@@ -303,7 +301,7 @@ async fn list_creation_requests(req: Request, ctx: RouteContext<()>) -> Result<R
     )
 }
 
-async fn create_certificate_request(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
+async fn issue_certificate(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let developer_id = param(&ctx, "developer_id");
     let Some(member) = membership(&req, &ctx, developer_id).await? else {
         return error("FORBIDDEN", "Active membership required", 403);
@@ -315,19 +313,66 @@ async fn create_certificate_request(mut req: Request, ctx: RouteContext<()>) -> 
     if let Err(reason) = input.validate() {
         return error("CERTIFICATE_REQUEST_INVALID", &reason, 422);
     }
-    match store::create_certificate_request(
-        &ctx.env.d1("DB")?,
+    let issued_at = now();
+    let db = ctx.env.d1("DB")?;
+    let (key, issuer) = match active_certificate_signer(&ctx.env, &db, issued_at as u64).await? {
+        Ok(value) => value,
+        Err(value) => return error(value.code, value.message, value.status),
+    };
+    let ttl = ctx
+        .env
+        .var("CERTIFICATE_TTL_SECONDS")?
+        .to_string()
+        .parse::<i64>()
+        .unwrap_or(31_536_000);
+    let not_after = issued_at.saturating_add(ttl.max(60)).min(issuer.not_after);
+    if not_after <= issued_at.saturating_add(59) {
+        return error(
+            "ISSUER_VALIDITY_TOO_SHORT",
+            "The active Intermediate expires too soon to issue a certificate",
+            503,
+        );
+    }
+    let mut serial_bytes = [0_u8; 8];
+    getrandom::fill(&mut serial_bytes)
+        .map_err(|_| Error::RustError("secure random generation failed".into()))?;
+    let serial = u64::from_le_bytes(serial_bytes).max(1);
+    let certificate_id = store::id(issued_at);
+    let request_id = store::id(issued_at);
+    let wire = certificate::issue(
+        certificate::IssueCertificate {
+            serial_number: serial,
+            developer_id,
+            not_before: issued_at as u64,
+            not_after: not_after as u64,
+            request: &input,
+        },
+        &key,
+    )
+    .map_err(Error::RustError)?;
+    let certificate_wire = certificate::encode_base64(&wire);
+    let row = store::issue_certificate(
+        &db,
         developer_id,
         &member.account_id,
         &input,
-        now(),
+        store::IssuedCertificateRecord {
+            request_id: &request_id,
+            certificate_id: &certificate_id,
+            serial: &serial.to_string(),
+            issuer: &issuer.key_id,
+            certificate_json: &certificate_wire,
+            not_before: issued_at,
+            not_after,
+            now: issued_at,
+        },
     )
-    .await
-    {
-        Ok(value) => json_response(&json!({"certificate_request": value}), 201),
-        Err(_) => error(
+    .await?;
+    match row {
+        Some(row) => json_response(&certificate_view(row)?, 201),
+        None => error(
             "DEVELOPER_NOT_ELIGIBLE",
-            "Developer must be active and verified",
+            "Developer must be active, verified, and requested by an eligible member",
             409,
         ),
     }
@@ -792,188 +837,6 @@ async fn admin_list_issuers(req: Request, ctx: RouteContext<()>) -> Result<Respo
     json_response(&json!({"issuers": issuers}), 200)
 }
 
-async fn admin_developer_policy(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    if require_admin(&req, &ctx.env).await?.is_none() {
-        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
-    }
-    let developer_id = param(&ctx, "developer_id");
-    let db = ctx.env.d1("DB")?;
-    if store::developer(&db, developer_id).await?.is_none() {
-        return error("DEVELOPER_NOT_FOUND", "Developer not found", 404);
-    }
-    json_response(
-        &json!({
-            "developer_id": developer_id,
-            "package_scopes": store::package_scope_grants(&db, developer_id).await?,
-            "capabilities": store::capability_grants(&db, developer_id).await?,
-            "global_issuable_capabilities": store::global_capabilities(&db).await?,
-        }),
-        200,
-    )
-}
-
-async fn admin_grant_package_scope(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let Some(actor) = require_admin(&req, &ctx.env).await? else {
-        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
-    };
-    let input: PackageScopeGrantInput = req.json().await?;
-    let scope = input.scope.trim();
-    if certificate::validate_package_scope(scope).is_err() {
-        return error("PACKAGE_SCOPE_INVALID", "Package scope is invalid", 422);
-    }
-    if !consume_admin_action(&actor, &ctx.env, "policy.package_scope.grant").await? {
-        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
-    }
-    let grant = store::grant_package_scope(
-        &ctx.env.d1("DB")?,
-        param(&ctx, "developer_id"),
-        scope,
-        &actor.account_id,
-        now(),
-    )
-    .await?;
-    match grant {
-        Some(grant) => json_response(&json!({"package_scope": grant}), 201),
-        None => error("DEVELOPER_NOT_FOUND", "Developer not found", 404),
-    }
-}
-
-async fn admin_revoke_package_scope(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let Some(actor) = require_admin(&req, &ctx.env).await? else {
-        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
-    };
-    if !consume_admin_action(&actor, &ctx.env, "policy.package_scope.revoke").await? {
-        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
-    }
-    if store::revoke_package_scope(
-        &ctx.env.d1("DB")?,
-        param(&ctx, "developer_id"),
-        param(&ctx, "grant_id"),
-        &actor.account_id,
-        now(),
-    )
-    .await?
-    {
-        Response::empty().map(|response| response.with_status(204))
-    } else {
-        error(
-            "PACKAGE_SCOPE_GRANT_NOT_FOUND",
-            "Package scope grant not found",
-            404,
-        )
-    }
-}
-
-async fn admin_grant_capability(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let Some(actor) = require_admin(&req, &ctx.env).await? else {
-        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
-    };
-    let input: CapabilityGrantInput = req.json().await?;
-    let capability = input.capability.trim();
-    if certificate::validate_capability(capability).is_err() {
-        return error("CAPABILITY_INVALID", "Capability is invalid", 422);
-    }
-    if !consume_admin_action(&actor, &ctx.env, "policy.capability.grant").await? {
-        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
-    }
-    let grant = store::grant_capability(
-        &ctx.env.d1("DB")?,
-        param(&ctx, "developer_id"),
-        capability,
-        &actor.account_id,
-        now(),
-    )
-    .await?;
-    match grant {
-        Some(grant) => json_response(&json!({"capability": grant}), 201),
-        None => error("DEVELOPER_NOT_FOUND", "Developer not found", 404),
-    }
-}
-
-async fn admin_revoke_capability(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let Some(actor) = require_admin(&req, &ctx.env).await? else {
-        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
-    };
-    if !consume_admin_action(&actor, &ctx.env, "policy.capability.revoke").await? {
-        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
-    }
-    if store::revoke_capability(
-        &ctx.env.d1("DB")?,
-        param(&ctx, "developer_id"),
-        param(&ctx, "grant_id"),
-        &actor.account_id,
-        now(),
-    )
-    .await?
-    {
-        Response::empty().map(|response| response.with_status(204))
-    } else {
-        error(
-            "CAPABILITY_GRANT_NOT_FOUND",
-            "Capability grant not found",
-            404,
-        )
-    }
-}
-
-async fn admin_global_capabilities(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    if require_admin(&req, &ctx.env).await?.is_none() {
-        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
-    }
-    json_response(
-        &json!({"capabilities": store::global_capabilities(&ctx.env.d1("DB")?).await?}),
-        200,
-    )
-}
-
-async fn admin_enable_global_capability(
-    mut req: Request,
-    ctx: RouteContext<()>,
-) -> Result<Response> {
-    let Some(actor) = require_admin(&req, &ctx.env).await? else {
-        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
-    };
-    let input: CapabilityGrantInput = req.json().await?;
-    let capability = input.capability.trim();
-    if certificate::validate_capability(capability).is_err() {
-        return error("CAPABILITY_INVALID", "Capability is invalid", 422);
-    }
-    if !consume_admin_action(&actor, &ctx.env, "policy.global_capability.enable").await? {
-        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
-    }
-    let capability = store::set_global_capability(
-        &ctx.env.d1("DB")?,
-        capability,
-        "active",
-        &actor.account_id,
-        now(),
-    )
-    .await?;
-    json_response(&json!({"capability": capability}), 201)
-}
-
-async fn admin_disable_global_capability(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let Some(actor) = require_admin(&req, &ctx.env).await? else {
-        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
-    };
-    let capability = param(&ctx, "capability");
-    if certificate::validate_capability(capability).is_err() {
-        return error("CAPABILITY_INVALID", "Capability is invalid", 422);
-    }
-    if !consume_admin_action(&actor, &ctx.env, "policy.global_capability.disable").await? {
-        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
-    }
-    let capability = store::set_global_capability(
-        &ctx.env.d1("DB")?,
-        capability,
-        "disabled",
-        &actor.account_id,
-        now(),
-    )
-    .await?;
-    json_response(&json!({"capability": capability}), 200)
-}
-
 async fn admin_change_issuer_status(
     mut req: Request,
     ctx: RouteContext<()>,
@@ -1048,30 +911,16 @@ async fn admin_review_queue(req: Request, ctx: RouteContext<()>) -> Result<Respo
     let db = ctx.env.d1("DB")?;
     let developers = store::pending_developer_reviews(&db).await?;
     let developer_creation_requests = store::pending_creation_reviews(&db).await?;
-    let certificate_requests = store::pending_certificate_reviews(&db)
+    let certificates = store::active_certificates(&db)
         .await?
         .into_iter()
-        .map(|request| {
-            Ok(json!({
-                "id": request.id,
-                "developer_id": request.developer_id,
-                "developer_display_name": request.developer_display_name,
-                "requested_by_account_id": request.requested_by_account_id,
-                "signature_algorithm": request.signature_algorithm,
-                "subject_key_id": request.subject_key_id,
-                "package_id_scopes": serde_json::from_str::<serde_json::Value>(&request.package_id_scopes_json)?,
-                "allowed_capabilities": serde_json::from_str::<serde_json::Value>(&request.allowed_capabilities_json)?,
-                "status": request.status,
-                "created_at": request.created_at,
-                "updated_at": request.updated_at,
-            }))
-        })
+        .map(certificate_view)
         .collect::<Result<Vec<_>>>()?;
     json_response(
         &json!({
             "developers": developers,
             "developer_creation_requests": developer_creation_requests,
-            "certificate_requests": certificate_requests,
+            "certificates": certificates,
         }),
         200,
     )
@@ -1279,216 +1128,6 @@ async fn active_certificate_signer(
         }));
     }
     Ok(Ok((signing_key, registry_issuer)))
-}
-
-async fn admin_issue(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let Some(actor) = require_admin(&req, &ctx.env).await? else {
-        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
-    };
-    let request_id = param(&ctx, "request_id");
-    let db = ctx.env.d1("DB")?;
-    let Some(request) = store::certificate_request(&db, request_id).await? else {
-        return error(
-            "CERTIFICATE_REQUEST_NOT_FOUND",
-            "Certificate request not found",
-            404,
-        );
-    };
-    if request.status != "pending" {
-        return error(
-            "CERTIFICATE_REQUEST_NOT_PENDING",
-            "Certificate request is not pending",
-            409,
-        );
-    }
-    let developer = store::developer(&db, &request.developer_id).await?;
-    if !developer
-        .as_ref()
-        .is_some_and(|d| d.status == "active" && d.verification_status == "verified")
-    {
-        return error(
-            "DEVELOPER_NOT_ELIGIBLE",
-            "Developer must be active and verified",
-            409,
-        );
-    }
-    let requester =
-        store::member_for_account(&db, &request.developer_id, &request.requested_by_account_id)
-            .await?;
-    if !requester
-        .as_ref()
-        .is_some_and(|member| can_request_certificate(&member.role))
-    {
-        return error(
-            "REQUESTER_NOT_ELIGIBLE",
-            "The requester is no longer an eligible active member",
-            409,
-        );
-    }
-    let input = certificate::CertificateRequestInput {
-        signature_algorithm: request.signature_algorithm.clone(),
-        subject_public_key: request.subject_public_key.clone(),
-        package_id_scopes: serde_json::from_str(&request.package_id_scopes_json)?,
-        allowed_capabilities: serde_json::from_str(&request.allowed_capabilities_json)?,
-    };
-    if input.validate().is_err()
-        || input.subject_key_id().ok().as_deref() != Some(&request.subject_key_id)
-    {
-        return error(
-            "CERTIFICATE_REQUEST_INVALID",
-            "The certificate request key or permissions are invalid",
-            409,
-        );
-    }
-    let granted_scopes: HashSet<String> = store::package_scope_grants(&db, &request.developer_id)
-        .await?
-        .into_iter()
-        .filter(|grant| grant.status == "active")
-        .map(|grant| grant.scope)
-        .collect();
-    if input
-        .package_id_scopes
-        .iter()
-        .any(|scope| !granted_scopes.contains(scope))
-    {
-        return error(
-            "PACKAGE_SCOPE_NOT_GRANTED",
-            "A requested Package ID scope is not currently granted",
-            409,
-        );
-    }
-    let granted_capabilities: HashSet<String> =
-        store::capability_grants(&db, &request.developer_id)
-            .await?
-            .into_iter()
-            .filter(|grant| grant.status == "active")
-            .map(|grant| grant.capability)
-            .collect();
-    let globally_issuable: HashSet<String> = store::global_capabilities(&db)
-        .await?
-        .into_iter()
-        .filter(|capability| capability.status == "active")
-        .map(|capability| capability.capability)
-        .collect();
-    if input.allowed_capabilities.iter().any(|capability| {
-        !granted_capabilities.contains(capability) || !globally_issuable.contains(capability)
-    }) {
-        return error(
-            "CAPABILITY_NOT_GRANTED",
-            "A requested Capability is not currently granted and globally issuable",
-            409,
-        );
-    }
-    let mut serial_bytes = [0_u8; 8];
-    getrandom::fill(&mut serial_bytes)
-        .map_err(|_| Error::RustError("secure random generation failed".into()))?;
-    let serial = u64::from_le_bytes(serial_bytes).max(1);
-    let issued_at = now();
-    let certificate_id = store::id(issued_at);
-    let ttl = ctx
-        .env
-        .var("CERTIFICATE_TTL_SECONDS")?
-        .to_string()
-        .parse::<i64>()
-        .unwrap_or(31_536_000);
-    let (key, issuer) = match active_certificate_signer(&ctx.env, &db, issued_at as u64).await? {
-        Ok(value) => value,
-        Err(value) => return error(value.code, value.message, value.status),
-    };
-    let not_after = issued_at.saturating_add(ttl.max(60)).min(issuer.not_after);
-    if not_after <= issued_at.saturating_add(59) {
-        return error(
-            "ISSUER_VALIDITY_TOO_SHORT",
-            "The active Intermediate expires too soon to issue a certificate",
-            503,
-        );
-    }
-    if !consume_admin_action(&actor, &ctx.env, "certificate.issue").await? {
-        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
-    }
-    let wire = certificate::issue(
-        certificate::IssueCertificate {
-            serial_number: serial,
-            developer_id: &request.developer_id,
-            not_before: issued_at as u64,
-            not_after: not_after as u64,
-            request: &input,
-        },
-        &key,
-    )
-    .map_err(Error::RustError)?;
-    let certificate_wire = certificate::encode_base64(&wire);
-    let row = store::issue_certificate(
-        &ctx.env.d1("DB")?,
-        &request,
-        store::IssuedCertificateRecord {
-            certificate_id: &certificate_id,
-            serial: &serial.to_string(),
-            issuer: &issuer.key_id,
-            certificate_json: &certificate_wire,
-            not_before: issued_at,
-            not_after,
-            actor: &actor.account_id,
-            now: issued_at,
-        },
-    )
-    .await?;
-    match row {
-        Some(row) => {
-            store::record_admin_audit(
-                &ctx.env.d1("DB")?,
-                Some(&request.developer_id),
-                &actor.account_id,
-                "admin.certificate.issue",
-                &actor.jti,
-                now(),
-            )
-            .await?;
-            json_response(&certificate_view(row)?, 201)
-        }
-        None => error(
-            "CERTIFICATE_ISSUE_CONFLICT",
-            "Certificate request changed or Developer became ineligible",
-            409,
-        ),
-    }
-}
-
-async fn admin_reject_certificate(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let Some(actor) = require_admin(&req, &ctx.env).await? else {
-        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
-    };
-    let input: ReviewInput = req.json().await.unwrap_or(ReviewInput {
-        rejection_reason: None,
-    });
-    if input.rejection_reason.as_deref().is_none_or(str::is_empty) {
-        return error(
-            "REJECTION_REASON_REQUIRED",
-            "Rejection reason required",
-            422,
-        );
-    }
-    if !consume_admin_action(&actor, &ctx.env, "certificate_request.reject").await? {
-        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
-    }
-    let row = store::reject_certificate_request(
-        &ctx.env.d1("DB")?,
-        param(&ctx, "request_id"),
-        &actor.account_id,
-        input.rejection_reason.as_deref(),
-        now(),
-    )
-    .await?;
-    store::record_admin_audit(
-        &ctx.env.d1("DB")?,
-        None,
-        &actor.account_id,
-        "admin.certificate_request.reject",
-        &actor.jti,
-        now(),
-    )
-    .await?;
-    json_response(&json!({"certificate_request": row}), 200)
 }
 
 struct GeneratedRevocationSnapshot {
@@ -1845,8 +1484,8 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/v1/developer-creation-requests", create_creation_request)
         .get_async("/v1/developer-creation-requests", list_creation_requests)
         .post_async(
-            "/v1/developers/:developer_id/certificate-requests",
-            create_certificate_request,
+            "/v1/developers/:developer_id/certificates",
+            issue_certificate,
         )
         .get_async(
             "/v1/developers/:developer_id/certificates",
@@ -1864,35 +1503,6 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .get_async("/v1/admin/review-queue", admin_review_queue)
         .post_async("/v1/admin/trust-snapshots", admin_register_trust_snapshot)
         .get_async("/v1/admin/issuers", admin_list_issuers)
-        .get_async(
-            "/v1/admin/developers/:developer_id/policy",
-            admin_developer_policy,
-        )
-        .post_async(
-            "/v1/admin/developers/:developer_id/package-scopes",
-            admin_grant_package_scope,
-        )
-        .delete_async(
-            "/v1/admin/developers/:developer_id/package-scopes/:grant_id",
-            admin_revoke_package_scope,
-        )
-        .post_async(
-            "/v1/admin/developers/:developer_id/capabilities",
-            admin_grant_capability,
-        )
-        .delete_async(
-            "/v1/admin/developers/:developer_id/capabilities/:grant_id",
-            admin_revoke_capability,
-        )
-        .get_async("/v1/admin/global-capabilities", admin_global_capabilities)
-        .post_async(
-            "/v1/admin/global-capabilities",
-            admin_enable_global_capability,
-        )
-        .delete_async(
-            "/v1/admin/global-capabilities/:capability",
-            admin_disable_global_capability,
-        )
         .post_async(
             "/v1/admin/revocation-snapshots/rebuild",
             admin_rebuild_revocation_snapshot,
@@ -1918,14 +1528,6 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async(
             "/v1/admin/developer-creation-requests/:request_id/reject",
             |req, ctx| admin_creation_review(req, ctx, "rejected"),
-        )
-        .post_async(
-            "/v1/admin/certificate-requests/:request_id/issue",
-            admin_issue,
-        )
-        .post_async(
-            "/v1/admin/certificate-requests/:request_id/reject",
-            admin_reject_certificate,
         )
         .post_async(
             "/v1/admin/certificates/:certificate_id/revoke",
@@ -1962,9 +1564,10 @@ mod tests {
         assert!(trust_schema.contains("signed revocation snapshots are append-only"));
         assert!(trust_schema.contains("issuer public key is immutable"));
         assert!(trust_schema.contains("authentication_replay_cache"));
-        assert!(trust_schema.contains("developer_package_scopes"));
-        assert!(trust_schema.contains("developer_capability_grants"));
-        assert!(trust_schema.contains("global_issuable_capabilities"));
+        let automatic_schema =
+            include_str!("../migrations/0003_automatic_certificate_issuance.sql");
+        assert!(automatic_schema.contains("Legacy pending request"));
+        assert!(automatic_schema.contains("DROP TABLE developer_package_scopes"));
     }
 
     #[test]
@@ -1985,9 +1588,18 @@ mod tests {
     }
 
     #[test]
-    fn admin_review_queue_is_read_only_and_authenticated() {
+    fn certificate_issuance_is_self_service_and_admin_can_only_revoke() {
         let source = include_str!("lib.rs");
-        assert!(source.contains(".get_async(\"/v1/admin/review-queue\", admin_review_queue)"));
-        assert!(source.contains("require_admin(&req, &ctx.env)"));
+        let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+        let store = include_str!("store.rs");
+        assert!(production.contains("/v1/developers/:developer_id/certificates"));
+        assert!(production.contains(".get_async(\"/v1/admin/review-queue\", admin_review_queue)"));
+        assert!(production.contains("require_admin(&req, &ctx.env)"));
+        assert!(production.contains("active_certificates(&db)"));
+        assert!(production.contains("/v1/admin/certificates/:certificate_id/revoke"));
+        assert!(!production.contains("/v1/admin/certificate-requests"));
+        assert!(!production.contains("admin_developer_policy"));
+        assert!(store.contains("member.role IN ('owner', 'admin', 'developer')"));
+        assert!(store.contains("'certificate.issued'"));
     }
 }
