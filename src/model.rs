@@ -101,6 +101,21 @@ pub struct CertificateRequestRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificateReviewRequest {
+    pub id: String,
+    pub developer_id: String,
+    pub developer_display_name: String,
+    pub requested_by_account_id: String,
+    pub signature_algorithm: String,
+    pub subject_key_id: String,
+    pub package_id_scopes_json: String,
+    pub allowed_capabilities_json: String,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificateRow {
     pub id: String,
     pub certificate_request_id: String,

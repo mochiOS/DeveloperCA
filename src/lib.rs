@@ -407,6 +407,42 @@ async fn require_admin(req: &Request, env: &Env) -> Result<Option<String>> {
     auth::admin(req, env).await
 }
 
+async fn admin_review_queue(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    if require_admin(&req, &ctx.env).await?.is_none() {
+        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
+    }
+    let db = ctx.env.d1("DB")?;
+    let developers = store::pending_developer_reviews(&db).await?;
+    let developer_creation_requests = store::pending_creation_reviews(&db).await?;
+    let certificate_requests = store::pending_certificate_reviews(&db)
+        .await?
+        .into_iter()
+        .map(|request| {
+            Ok(json!({
+                "id": request.id,
+                "developer_id": request.developer_id,
+                "developer_display_name": request.developer_display_name,
+                "requested_by_account_id": request.requested_by_account_id,
+                "signature_algorithm": request.signature_algorithm,
+                "subject_key_id": request.subject_key_id,
+                "package_id_scopes": serde_json::from_str::<serde_json::Value>(&request.package_id_scopes_json)?,
+                "allowed_capabilities": serde_json::from_str::<serde_json::Value>(&request.allowed_capabilities_json)?,
+                "status": request.status,
+                "created_at": request.created_at,
+                "updated_at": request.updated_at,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    json_response(
+        &json!({
+            "developers": developers,
+            "developer_creation_requests": developer_creation_requests,
+            "certificate_requests": certificate_requests,
+        }),
+        200,
+    )
+}
+
 async fn admin_verification(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Some(actor) = require_admin(&req, &ctx.env).await? else {
         return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
@@ -654,6 +690,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             "/v1/certificates/:certificate_id/status",
             certificate_status,
         )
+        .get_async("/v1/admin/review-queue", admin_review_queue)
         .post_async(
             "/v1/admin/developers/:developer_id/verification",
             admin_verification,
@@ -709,5 +746,12 @@ mod tests {
             assert!(!manifest.contains(forbidden));
             assert!(!config.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn admin_review_queue_is_read_only_and_authenticated() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains(".get_async(\"/v1/admin/review-queue\", admin_review_queue)"));
+        assert!(source.contains("require_admin(&req, &ctx.env)"));
     }
 }

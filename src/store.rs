@@ -4,7 +4,8 @@ use worker::{D1Database, Result, wasm_bindgen::JsValue};
 
 use crate::certificate::CertificateRequestInput;
 use crate::model::{
-    CertificateRequestRow, CertificateRow, CreationRequest, Developer, Member, Revocation,
+    CertificateRequestRow, CertificateReviewRequest, CertificateRow, CreationRequest, Developer,
+    Member, Revocation,
 };
 
 fn value(value: impl AsRef<str>) -> JsValue {
@@ -47,6 +48,13 @@ pub async fn list_developers(db: &D1Database, account_id: &str) -> Result<Vec<De
          FROM developer_members m JOIN developers d ON d.id = m.developer_id
          WHERE m.account_id = ?1 AND m.status = 'active' AND d.status != 'deleted' ORDER BY d.created_at",
     ).bind(&[value(account_id)])?).await
+}
+
+pub async fn pending_developer_reviews(db: &D1Database) -> Result<Vec<Developer>> {
+    all(db.prepare(
+        "SELECT id, developer_type, display_name, status, verification_status, created_at, updated_at
+         FROM developers WHERE status='active' AND verification_status='pending' ORDER BY created_at",
+    )).await
 }
 
 pub async fn member_for_account(
@@ -190,6 +198,15 @@ pub async fn list_creation_requests(
     ).bind(&[value(account_id)])?).await
 }
 
+pub async fn pending_creation_reviews(db: &D1Database) -> Result<Vec<CreationRequest>> {
+    all(db.prepare(
+        "SELECT id, account_id, requested_display_name, requested_developer_type, reason, status,
+         reviewed_by_account_id, reviewed_at, rejection_reason, created_at, updated_at
+         FROM developer_creation_requests WHERE status='pending' ORDER BY created_at",
+    ))
+    .await
+}
+
 pub async fn review_creation_request(
     db: &D1Database,
     request_id: &str,
@@ -278,6 +295,17 @@ pub async fn certificate_request(
          package_id_scopes_json, allowed_capabilities_json, status, created_at, updated_at
          FROM certificate_requests WHERE id=?1",
     ).bind(&[value(request_id)])?.first(None).await
+}
+
+pub async fn pending_certificate_reviews(db: &D1Database) -> Result<Vec<CertificateReviewRequest>> {
+    all(db.prepare(
+        "SELECT r.id, r.developer_id, d.display_name AS developer_display_name,
+         r.requested_by_account_id, r.signature_algorithm, r.subject_key_id,
+         r.package_id_scopes_json, r.allowed_capabilities_json, r.status, r.created_at, r.updated_at
+         FROM certificate_requests r JOIN developers d ON d.id=r.developer_id
+         WHERE r.status='pending' ORDER BY r.created_at",
+    ))
+    .await
 }
 
 pub struct IssuedCertificateRecord<'a> {
