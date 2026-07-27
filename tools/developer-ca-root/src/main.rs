@@ -88,8 +88,8 @@ enum TrustSnapshotCommand {
     Issue {
         #[arg(long)]
         root_key: PathBuf,
-        #[arg(long)]
-        issuers: PathBuf,
+        #[arg(long = "issuer", required = true)]
+        issuers: Vec<PathBuf>,
         #[arg(long)]
         version: u64,
         #[arg(long)]
@@ -328,14 +328,17 @@ fn create_key(
 
 fn issue_trust_snapshot(
     root_key_path: &Path,
-    issuer_path: &Path,
+    issuer_paths: &[PathBuf],
     version: u64,
     generated_at: u64,
     expires_at: u64,
     output: &Path,
 ) -> Result<()> {
     let root_key = read_signing_key(root_key_path)?;
-    let mut issuers: Vec<IssuerRecord> = read_json(issuer_path)?;
+    let mut issuers = issuer_paths
+        .iter()
+        .map(|path| read_json::<IssuerRecord>(path))
+        .collect::<Result<Vec<_>>>()?;
     issuers.sort_by(|left, right| left.issuer_key_id.cmp(&right.issuer_key_id));
     let snapshot = TrustSnapshot::issue(
         UnsignedTrustSnapshot {
@@ -456,14 +459,9 @@ mod tests {
             )),
         )
         .expect("create issuer");
-        let issuers = directory.path().join("issuers.json");
-        write_json(
-            &issuers,
-            &vec![read_json::<IssuerRecord>(&issuer_record).expect("issuer record")],
-        )
-        .expect("write issuer list");
         let output = directory.path().join("trust.json");
-        issue_trust_snapshot(&root_key, &issuers, 1, 100, 200, &output).expect("issue snapshot");
+        issue_trust_snapshot(&root_key, &[issuer_record], 1, 100, 200, &output)
+            .expect("issue snapshot");
         let snapshot: TrustSnapshot = read_json(&output).expect("read snapshot");
         snapshot
             .verify(

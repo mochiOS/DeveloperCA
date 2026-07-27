@@ -15,12 +15,12 @@ cargo run --manifest-path tools/developer-ca-root/Cargo.toml -- issuer create `
   --usage developer-certificate-signing --usage revocation-signing
 ```
 
-`issuer.json`を要素とするJSON配列`issuers.json`を作り、key ID順に並べます。CLIは発行時にも
-並べ替えと形式検証を行います。
+Issuer recordは`--issuer`で1件以上指定します。ローテーション時は同optionを繰り返して
+新旧すべてのrecordを渡します。CLIがkey ID順の並べ替えと形式検証を行います。
 
 ```powershell
 cargo run --manifest-path tools/developer-ca-root/Cargo.toml -- trust-snapshot issue `
-  --root-key C:\offline\root.seed --issuers C:\offline\issuers.json `
+  --root-key C:\offline\root.seed --issuer C:\offline\issuer.json `
   --version 1 --generated-at 1785100000 --expires-at 1800652000 `
   --output C:\transfer\trust-v1.json
 
