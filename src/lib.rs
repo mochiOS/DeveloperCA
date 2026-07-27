@@ -1484,7 +1484,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/v1/developer-creation-requests", create_creation_request)
         .get_async("/v1/developer-creation-requests", list_creation_requests)
         .post_async(
-            "/v1/developers/:developer_id/certificates",
+            "/v1/developers/:developer_id/certificates/issue",
             issue_certificate,
         )
         .get_async(
@@ -1592,7 +1592,7 @@ mod tests {
         let source = include_str!("lib.rs");
         let production = source.split("#[cfg(test)]").next().unwrap_or_default();
         let store = include_str!("store.rs");
-        assert!(production.contains("/v1/developers/:developer_id/certificates"));
+        assert!(production.contains("/v1/developers/:developer_id/certificates/issue"));
         assert!(production.contains(".get_async(\"/v1/admin/review-queue\", admin_review_queue)"));
         assert!(production.contains("require_admin(&req, &ctx.env)"));
         assert!(production.contains("active_certificates(&db)"));
