@@ -375,18 +375,31 @@ fn snapshot_response(
     cache_control: &str,
 ) -> Result<Response> {
     let quoted_etag = format!("\"{etag}\"");
-    let mut response =
-        if request.headers().get("If-None-Match")?.as_deref() == Some(quoted_etag.as_str()) {
-            Response::empty()?.with_status(304)
-        } else {
-            Response::from_bytes(snapshot_json.into_bytes())?.with_status(200)
-        };
+    let not_modified = request
+        .headers()
+        .get("If-None-Match")?
+        .is_some_and(|header| etag_matches(&header, &quoted_etag));
+    let mut response = if not_modified {
+        Response::empty()?.with_status(304)
+    } else {
+        Response::from_bytes(snapshot_json.into_bytes())?.with_status(200)
+    };
     response
         .headers_mut()
         .set("Content-Type", "application/json; charset=utf-8")?;
     response.headers_mut().set("ETag", &quoted_etag)?;
     response.headers_mut().set("Cache-Control", cache_control)?;
     Ok(response)
+}
+
+fn etag_matches(header: &str, quoted_etag: &str) -> bool {
+    header.split(',').map(str::trim).any(|candidate| {
+        candidate == "*"
+            || candidate == quoted_etag
+            || candidate
+                .strip_prefix("W/")
+                .is_some_and(|weak| weak == quoted_etag)
+    })
 }
 
 async fn trust_store(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -1924,6 +1937,17 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
 #[cfg(test)]
 mod tests {
+    use super::etag_matches;
+
+    #[test]
+    fn snapshot_etag_accepts_cloudflare_weak_and_list_validators() {
+        assert!(etag_matches("\"abc\"", "\"abc\""));
+        assert!(etag_matches("W/\"abc\"", "\"abc\""));
+        assert!(etag_matches("\"other\", W/\"abc\"", "\"abc\""));
+        assert!(etag_matches("*", "\"abc\""));
+        assert!(!etag_matches("W/\"other\"", "\"abc\""));
+    }
+
     #[test]
     fn schema_enforces_ownership_and_unique_serials() {
         let schema = include_str!("../migrations/0001_developer_ca.sql");
