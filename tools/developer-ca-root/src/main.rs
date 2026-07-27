@@ -148,6 +148,13 @@ struct PublicKeyRecord {
     public_key: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PublicKeyInput {
+    Public(PublicKeyRecord),
+    Issuer(IssuerRecord),
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Root { command } => match command {
@@ -377,10 +384,13 @@ fn read_signing_key(path: &Path) -> Result<SigningKey> {
 }
 
 fn read_public_key(path: &Path) -> Result<[u8; 32]> {
-    let record: PublicKeyRecord = read_json(path)?;
-    let key = mochios_developer_ca_trust::decode_public_key(&record.public_key)
+    let (expected_key_id, public_key) = match read_json::<PublicKeyInput>(path)? {
+        PublicKeyInput::Public(record) => (record.key_id, record.public_key),
+        PublicKeyInput::Issuer(record) => (record.issuer_key_id, record.public_key),
+    };
+    let key = mochios_developer_ca_trust::decode_public_key(&public_key)
         .context("invalid public key")?;
-    if key_id(&key) != record.key_id {
+    if key_id(&key) != expected_key_id {
         bail!("public key ID does not match public key");
     }
     Ok(key)
@@ -459,6 +469,13 @@ mod tests {
             )),
         )
         .expect("create issuer");
+        assert_eq!(
+            read_public_key(&issuer_record).expect("issuer public key"),
+            read_signing_key(&issuer_key)
+                .expect("issuer private key")
+                .verifying_key()
+                .to_bytes()
+        );
         let output = directory.path().join("trust.json");
         issue_trust_snapshot(&root_key, &[issuer_record], 1, 100, 200, &output)
             .expect("issue snapshot");
