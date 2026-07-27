@@ -10,6 +10,10 @@ ACCOUNTS_BASE_URL = "https://accounts.mochios.org"
 CERTIFICATE_TTL_SECONDS = "31536000"
 ISSUER_KEY_ID = "development-intermediate-1"
 
+[[routes]]
+pattern = "ca.mochios.org"
+custom_domain = true
+
 [[d1_databases]]
 binding = "DB"
 database_name = "mochios-developer-ca"
