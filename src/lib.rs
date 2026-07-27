@@ -730,6 +730,16 @@ mod tests {
         assert!(schema.contains("serial_number TEXT NOT NULL UNIQUE"));
         assert!(schema.contains("developer_id TEXT NOT NULL REFERENCES developers(id)"));
         assert!(schema.contains("audit_logs_no_update"));
+
+        let trust_schema = include_str!("../migrations/0002_trust_issuers_policy.sql");
+        assert!(trust_schema.contains("idx_issuers_single_active"));
+        assert!(trust_schema.contains("signed trust snapshots are append-only"));
+        assert!(trust_schema.contains("signed revocation snapshots are append-only"));
+        assert!(trust_schema.contains("issuer public key is immutable"));
+        assert!(trust_schema.contains("authentication_replay_cache"));
+        assert!(trust_schema.contains("developer_package_scopes"));
+        assert!(trust_schema.contains("developer_capability_grants"));
+        assert!(trust_schema.contains("global_issuable_capabilities"));
     }
 
     #[test]
