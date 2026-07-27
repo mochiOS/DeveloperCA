@@ -1,17 +1,18 @@
-# Trustモデル
+# Trustモデルとローテーション
 
-本番の信頼階層は次のとおりです。
+Issuer Trust SnapshotはOffline Rootが
+`mochios-issuer-trust-snapshot-v1\0 || canonical_snapshot_bytes`へ署名します。Issuerは
+`future`、`active`、`retired`、`revoked`のいずれかです。activeは最大1件です。
 
-```text
-Offline Root CA
-    -> Online Developer Intermediate CA
-        -> Developer Certificate
-```
+- `future`: 将来用。発行不可
+- `active`: 新規Certificate発行可
+- `retired`: 新規発行不可。既存Certificate検証可
+- `revoked`: 発行・検証とも不可
 
-Offline Root秘密鍵をWorker、D1、CI、ログへ配置してはいけません。実装済みsigner
-が受け取る`INTERMEDIATE_PRIVATE_KEY`は、開発用直接issuerまたはOnline
-IntermediateのEd25519 seedです。`/v1/trust-store`はissuer ID、algorithm、
-公開鍵だけを公開します。
+ローテーションは、future鍵を含むsnapshot、active切替snapshot、旧鍵をretiredにした
+snapshotの順にRoot署名して登録します。旧鍵をretiredにしても、その有効期間内に発行
+されたCertificateは無効になりません。同じkey IDへ別公開鍵を割り当てること、既存Issuer
+を新snapshotから省略すること、statusを逆行させることは禁止します。
 
-Root ceremony、Intermediate証明書作成、HSM統合は将来構想であり未実装です。
-
+Worker内のOnline秘密鍵とactive issuerが一致しない期間は、意図的に新規発行を停止します。
+鍵変更より前にRoot署名snapshotを準備してください。
