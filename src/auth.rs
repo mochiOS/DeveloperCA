@@ -1,5 +1,6 @@
+use base64::{Engine, engine::general_purpose::STANDARD};
+use mochios_developer_ca_auth_token::{Claims, TOKEN_PREFIX, verify};
 use serde::Deserialize;
-use subtle::ConstantTimeEq;
 use worker::{Fetch, Headers, Method, Request, RequestInit, Result, wasm_bindgen::JsValue};
 
 #[derive(Debug, Deserialize)]
@@ -20,8 +21,11 @@ struct AccountState {
     status: String,
 }
 
-fn constant_time_eq(expected: &str, provided: &str) -> bool {
-    expected.len() == provided.len() && bool::from(expected.as_bytes().ct_eq(provided.as_bytes()))
+#[derive(Debug, Clone)]
+pub struct AdminActor {
+    pub account_id: String,
+    pub jti: String,
+    pub expires_at: i64,
 }
 
 fn service_headers(env: &worker::Env) -> Result<Headers> {
@@ -36,8 +40,13 @@ pub async fn account(req: &Request, env: &worker::Env) -> Result<Option<String>>
         .strip_prefix("Bearer ")
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    if token.is_some_and(|value| value.starts_with(&format!("{TOKEN_PREFIX}."))) {
+        return Ok(delegation(req, env, "developer-ca", "delegated_account")
+            .await?
+            .map(|claims| claims.sub));
+    }
     if token.is_none() {
-        return console_account(req, env).await;
+        return Ok(None);
     }
     let token = token.unwrap_or_default();
     let base = env.var("ACCOUNTS_BASE_URL")?.to_string();
@@ -71,21 +80,6 @@ pub async fn account(req: &Request, env: &worker::Env) -> Result<Option<String>>
     )
 }
 
-async fn console_account(req: &Request, env: &worker::Env) -> Result<Option<String>> {
-    let expected = env.secret("CONSOLE_SERVICE_TOKEN")?.to_string();
-    let provided = req
-        .headers()
-        .get("X-Console-Service-Token")?
-        .unwrap_or_default();
-    let account_id = req.headers().get("X-Account-ID")?.unwrap_or_default();
-    if expected.is_empty() || account_id.is_empty() || !constant_time_eq(&expected, &provided) {
-        return Ok(None);
-    }
-    Ok(account_is_active(&account_id, env)
-        .await?
-        .then_some(account_id))
-}
-
 pub async fn account_is_active(account_id: &str, env: &worker::Env) -> Result<bool> {
     let base = env.var("ACCOUNTS_BASE_URL")?.to_string();
     let mut init = RequestInit::new();
@@ -108,14 +102,97 @@ pub async fn account_is_active(account_id: &str, env: &worker::Env) -> Result<bo
     Ok(envelope.account.id == account_id && envelope.account.status == "active")
 }
 
-pub async fn admin(req: &Request, env: &worker::Env) -> Result<Option<String>> {
-    let expected = env.secret("ADMIN_TOKEN")?.to_string();
-    let provided = req.headers().get("X-Admin-Token")?.unwrap_or_default();
-    let account_id = req.headers().get("X-Admin-Account-ID")?.unwrap_or_default();
-    if expected.is_empty() || account_id.is_empty() || !constant_time_eq(&expected, &provided) {
+async fn delegation(
+    req: &Request,
+    env: &worker::Env,
+    audience: &str,
+    role: &str,
+) -> Result<Option<Claims>> {
+    let authorization = req.headers().get("Authorization")?.unwrap_or_default();
+    let Some(token) = authorization.strip_prefix("Bearer ").map(str::trim) else {
         return Ok(None);
+    };
+    let bytes = STANDARD
+        .decode(env.secret("CONSOLE_TOKEN_PUBLIC_KEY")?.to_string())
+        .map_err(|_| worker::Error::RustError("invalid Console token public key".into()))?;
+    let public_key: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| worker::Error::RustError("invalid Console token public key".into()))?;
+    let now = worker::Date::now().as_millis() / 1000;
+    let claims = match verify(token, &public_key, now) {
+        Ok(claims) if claims_match(&claims, audience, role) => claims,
+        _ => return Ok(None),
+    };
+    Ok(account_is_active(&claims.sub, env).await?.then_some(claims))
+}
+
+fn claims_match(claims: &Claims, audience: &str, role: &str) -> bool {
+    claims.iss == "console.mochios.org"
+        && claims.aud == audience
+        && claims.role == role
+        && claims.act.as_deref() == Some("mochios-console")
+}
+
+pub async fn admin(req: &Request, env: &worker::Env) -> Result<Option<AdminActor>> {
+    Ok(
+        delegation(req, env, "developer-ca-admin", "developer_ca_reviewer")
+            .await?
+            .map(|claims| AdminActor {
+                account_id: claims.sub,
+                jti: claims.jti,
+                expires_at: claims.exp as i64,
+            }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claims() -> Claims {
+        Claims {
+            iss: "console.mochios.org".into(),
+            sub: "018f0000-0000-7000-8000-000000000001".into(),
+            aud: "developer-ca-admin".into(),
+            iat: 100,
+            exp: 160,
+            jti: "fixture".into(),
+            role: "developer_ca_reviewer".into(),
+            act: Some("mochios-console".into()),
+        }
     }
-    Ok(account_is_active(&account_id, env)
-        .await?
-        .then_some(account_id))
+
+    #[test]
+    fn admin_claims_require_fixed_issuer_audience_role_and_actor() {
+        let valid = claims();
+        assert!(claims_match(
+            &valid,
+            "developer-ca-admin",
+            "developer_ca_reviewer"
+        ));
+        for invalid in [
+            Claims {
+                iss: "attacker.example".into(),
+                ..valid.clone()
+            },
+            Claims {
+                aud: "developer-ca".into(),
+                ..valid.clone()
+            },
+            Claims {
+                role: "delegated_account".into(),
+                ..valid.clone()
+            },
+            Claims {
+                act: Some("other-service".into()),
+                ..valid.clone()
+            },
+        ] {
+            assert!(!claims_match(
+                &invalid,
+                "developer-ca-admin",
+                "developer_ca_reviewer"
+            ));
+        }
+    }
 }

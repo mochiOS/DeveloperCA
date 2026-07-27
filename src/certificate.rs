@@ -9,6 +9,16 @@ use serde_json::{Value, json};
 
 pub const SIGNATURE_ALGORITHM: &str = "ed25519";
 
+pub fn validate_package_scope(value: &str) -> Result<(), String> {
+    parse_scopes(&[value.to_owned()]).map(|_| ())
+}
+
+pub fn validate_capability(value: &str) -> Result<(), String> {
+    is_valid_capability(value)
+        .then_some(())
+        .ok_or_else(|| "invalid capability".into())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CertificateRequestInput {

@@ -25,6 +25,17 @@ pub enum IssuerStatus {
     Revoked,
 }
 
+impl IssuerStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Future => "future",
+            Self::Active => "active",
+            Self::Retired => "retired",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IssuerRecord {
@@ -78,6 +89,18 @@ impl RevocationReasonCode {
             Self::Unspecified => "unspecified",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "key_compromise" => Self::KeyCompromise,
+            "developer_suspended" => Self::DeveloperSuspended,
+            "certificate_replaced" => Self::CertificateReplaced,
+            "scope_violation" => Self::ScopeViolation,
+            "administrative" => Self::Administrative,
+            "unspecified" => Self::Unspecified,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -129,6 +152,12 @@ pub enum TrustError {
     DuplicateRevocation,
     UnsortedRevocations,
     InvalidSignature,
+    SnapshotRollback,
+    MissingIssuer,
+    PublicKeyReplacement,
+    InvalidStatusTransition,
+    MissingRevocation,
+    ConflictingRevocation,
     SnapshotTooLarge,
     EncodingOverflow,
 }
@@ -211,6 +240,75 @@ impl RevocationSnapshot {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, TrustError> {
         revocation_signing_message(&self.content)
     }
+}
+
+pub fn validate_trust_successor(
+    current: &TrustSnapshot,
+    next: &TrustSnapshot,
+) -> Result<(), TrustError> {
+    validate_trust(&current.content)?;
+    validate_trust(&next.content)?;
+    if next.content.snapshot_version <= current.content.snapshot_version
+        || next.content.generated_at < current.content.generated_at
+    {
+        return Err(TrustError::SnapshotRollback);
+    }
+    for existing in &current.content.issuers {
+        let replacement = next
+            .content
+            .issuers
+            .iter()
+            .find(|candidate| candidate.issuer_key_id == existing.issuer_key_id)
+            .ok_or(TrustError::MissingIssuer)?;
+        if replacement.public_key != existing.public_key {
+            return Err(TrustError::PublicKeyReplacement);
+        }
+        if !issuer_transition_allowed(existing.status, replacement.status) {
+            return Err(TrustError::InvalidStatusTransition);
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_revocation_successor(
+    current: &RevocationSnapshot,
+    next: &RevocationSnapshot,
+) -> Result<(), TrustError> {
+    validate_revocations(&current.content)?;
+    validate_revocations(&next.content)?;
+    if next.content.snapshot_version <= current.content.snapshot_version
+        || next.content.generated_at < current.content.generated_at
+    {
+        return Err(TrustError::SnapshotRollback);
+    }
+    for existing in &current.content.revocations {
+        let replacement = next
+            .content
+            .revocations
+            .iter()
+            .find(|candidate| candidate.certificate_serial == existing.certificate_serial)
+            .ok_or(TrustError::MissingRevocation)?;
+        if replacement != existing {
+            return Err(TrustError::ConflictingRevocation);
+        }
+    }
+    Ok(())
+}
+
+fn issuer_transition_allowed(previous: IssuerStatus, next: IssuerStatus) -> bool {
+    matches!(
+        (previous, next),
+        (
+            IssuerStatus::Future,
+            IssuerStatus::Future | IssuerStatus::Active | IssuerStatus::Revoked
+        ) | (
+            IssuerStatus::Active,
+            IssuerStatus::Active | IssuerStatus::Retired | IssuerStatus::Revoked
+        ) | (
+            IssuerStatus::Retired,
+            IssuerStatus::Retired | IssuerStatus::Revoked
+        ) | (IssuerStatus::Revoked, IssuerStatus::Revoked)
+    )
 }
 
 pub fn key_id(public_key: &[u8; 32]) -> String {
@@ -314,7 +412,10 @@ fn validate_revocations(content: &UnsignedRevocationSnapshot) -> Result<(), Trus
     for revocation in &content.revocations {
         if revocation.certificate_serial.is_empty()
             || revocation.certificate_serial.len() > 32
-            || !revocation.certificate_serial.bytes().all(|byte| byte.is_ascii_digit())
+            || !revocation
+                .certificate_serial
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
         {
             return Err(TrustError::InvalidSerial);
         }
@@ -386,9 +487,7 @@ fn trust_signing_message(content: &UnsignedTrustSnapshot) -> Result<Vec<u8>, Tru
     bounded(bytes)
 }
 
-fn revocation_signing_message(
-    content: &UnsignedRevocationSnapshot,
-) -> Result<Vec<u8>, TrustError> {
+fn revocation_signing_message(content: &UnsignedRevocationSnapshot) -> Result<Vec<u8>, TrustError> {
     validate_revocations(content)?;
     let mut bytes = Vec::with_capacity(1024);
     bytes.extend_from_slice(REVOCATION_DOMAIN);
@@ -407,8 +506,13 @@ fn revocation_signing_message(
     bounded(bytes)
 }
 
-fn verify_signature(public_key: &[u8; 32], encoded: &str, message: &[u8]) -> Result<(), TrustError> {
-    let verifier = VerifyingKey::from_bytes(public_key).map_err(|_| TrustError::InvalidPublicKey)?;
+fn verify_signature(
+    public_key: &[u8; 32],
+    encoded: &str,
+    message: &[u8],
+) -> Result<(), TrustError> {
+    let verifier =
+        VerifyingKey::from_bytes(public_key).map_err(|_| TrustError::InvalidPublicKey)?;
     let signature = STANDARD
         .decode(encoded)
         .map_err(|_| TrustError::InvalidSignature)?;
@@ -500,7 +604,12 @@ mod tests {
             snapshot.canonical_bytes().expect("canonical bytes"),
             snapshot.canonical_bytes().expect("canonical bytes")
         );
-        assert!(snapshot.canonical_bytes().expect("canonical bytes").starts_with(TRUST_DOMAIN));
+        assert!(
+            snapshot
+                .canonical_bytes()
+                .expect("canonical bytes")
+                .starts_with(TRUST_DOMAIN)
+        );
     }
 
     #[test]
@@ -549,5 +658,115 @@ mod tests {
                 .expect("canonical bytes")
                 .starts_with(REVOCATION_DOMAIN)
         );
+    }
+
+    #[test]
+    fn trust_successor_rejects_version_time_issuer_omission_and_status_rollback() {
+        let root = SigningKey::from_bytes(&[3; 32]);
+        let issuer = SigningKey::from_bytes(&[5; 32]);
+        let current = trust(&root, &issuer);
+
+        let mut content = current.content.clone();
+        content.snapshot_version = 1;
+        content.generated_at = 101;
+        let same_version = TrustSnapshot::issue(content, &root).expect("same-version fixture");
+        assert_eq!(
+            validate_trust_successor(&current, &same_version),
+            Err(TrustError::SnapshotRollback)
+        );
+
+        let mut content = current.content.clone();
+        content.snapshot_version = 2;
+        content.generated_at = 99;
+        let old_time = TrustSnapshot::issue(content, &root).expect("old-time fixture");
+        assert_eq!(
+            validate_trust_successor(&current, &old_time),
+            Err(TrustError::SnapshotRollback)
+        );
+
+        let mut content = current.content.clone();
+        content.snapshot_version = 2;
+        content.generated_at = 101;
+        content.issuers.clear();
+        let omitted = TrustSnapshot::issue(content, &root).expect("omitted fixture");
+        assert_eq!(
+            validate_trust_successor(&current, &omitted),
+            Err(TrustError::MissingIssuer)
+        );
+
+        let mut content = current.content.clone();
+        content.snapshot_version = 2;
+        content.generated_at = 101;
+        content.issuers[0].status = IssuerStatus::Future;
+        let rolled_back = TrustSnapshot::issue(content, &root).expect("status fixture");
+        assert_eq!(
+            validate_trust_successor(&current, &rolled_back),
+            Err(TrustError::InvalidStatusTransition)
+        );
+    }
+
+    #[test]
+    fn revocation_successor_must_be_monotonic_cumulative_and_consistent() {
+        let issuer = SigningKey::from_bytes(&[5; 32]);
+        let issue = |version, generated_at, revocations| {
+            RevocationSnapshot::issue(
+                UnsignedRevocationSnapshot {
+                    format_version: REVOCATION_FORMAT_VERSION,
+                    snapshot_version: version,
+                    generated_at,
+                    expires_at: generated_at + 50,
+                    issuer_key_id: key_id(&issuer.verifying_key().to_bytes()),
+                    revocations,
+                    signature_algorithm: SIGNATURE_ALGORITHM.into(),
+                },
+                &issuer,
+            )
+            .expect("revocation fixture")
+        };
+        let revoked = SnapshotRevocation {
+            certificate_serial: "42".into(),
+            revoked_at: 101,
+            reason_code: RevocationReasonCode::KeyCompromise,
+        };
+        let current = issue(1, 100, vec![revoked.clone()]);
+        assert_eq!(
+            validate_revocation_successor(&current, &issue(1, 101, vec![revoked.clone()])),
+            Err(TrustError::SnapshotRollback)
+        );
+        assert_eq!(
+            validate_revocation_successor(&current, &issue(2, 99, vec![revoked.clone()])),
+            Err(TrustError::SnapshotRollback)
+        );
+        assert_eq!(
+            validate_revocation_successor(&current, &issue(2, 101, vec![])),
+            Err(TrustError::MissingRevocation)
+        );
+        let conflicting = SnapshotRevocation {
+            reason_code: RevocationReasonCode::Administrative,
+            ..revoked.clone()
+        };
+        assert_eq!(
+            validate_revocation_successor(&current, &issue(2, 101, vec![conflicting])),
+            Err(TrustError::ConflictingRevocation)
+        );
+        assert!(validate_revocation_successor(&current, &issue(2, 101, vec![revoked])).is_ok());
+    }
+
+    #[test]
+    fn snapshot_json_rejects_unknown_status_and_reason_code() {
+        let root = SigningKey::from_bytes(&[3; 32]);
+        let issuer = SigningKey::from_bytes(&[5; 32]);
+        let trust_json = serde_json::to_string(&trust(&root, &issuer)).expect("serialize trust");
+        assert!(
+            serde_json::from_str::<TrustSnapshot>(&trust_json.replace("active", "unknown"))
+                .is_err()
+        );
+        let reason_json = r#"{
+            "format_version":1,"snapshot_version":1,"generated_at":100,"expires_at":150,
+            "issuer_key_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "revocations":[{"certificate_serial":"1","revoked_at":101,"reason_code":"unknown"}],
+            "signature_algorithm":"ed25519","signature":"invalid"
+        }"#;
+        assert!(serde_json::from_str::<RevocationSnapshot>(reason_json).is_err());
     }
 }

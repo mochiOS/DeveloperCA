@@ -83,6 +83,49 @@ pub struct VerificationInput {
 #[serde(deny_unknown_fields)]
 pub struct RevokeInput {
     pub reason: String,
+    pub reason_code: Option<mochios_developer_ca_trust::RevocationReasonCode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageScopeGrantInput {
+    pub scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityGrantInput {
+    pub capability: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageScopeGrant {
+    pub id: String,
+    pub developer_id: String,
+    pub scope: String,
+    pub status: String,
+    pub granted_by_account_id: String,
+    pub created_at: i64,
+    pub revoked_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityGrant {
+    pub id: String,
+    pub developer_id: String,
+    pub capability: String,
+    pub status: String,
+    pub granted_by_account_id: String,
+    pub created_at: i64,
+    pub revoked_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalCapability {
+    pub capability: String,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +179,50 @@ pub struct Revocation {
     pub certificate_id: String,
     pub serial_number: String,
     pub reason: String,
+    pub reason_code: String,
     pub revoked_by_account_id: String,
     pub revoked_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuerRow {
+    pub key_id: String,
+    pub public_key: String,
+    pub status: String,
+    pub not_before: i64,
+    pub not_after: i64,
+    pub allowed_key_usages_json: String,
+    pub trust_snapshot_version: i64,
+    pub root_signed_record: String,
+    pub created_at: i64,
+    pub activated_at: Option<i64>,
+    pub retired_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+    pub revocation_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustSnapshotRow {
+    pub snapshot_version: i64,
+    pub generated_at: i64,
+    pub expires_at: i64,
+    pub root_key_id: String,
+    pub snapshot_json: String,
+    pub etag: String,
+    pub is_current: i64,
+    pub registered_by_account_id: String,
+    pub registered_at: i64,
+    pub admin_token_jti: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevocationSnapshotRow {
+    pub snapshot_version: i64,
+    pub generated_at: i64,
+    pub expires_at: i64,
+    pub issuer_key_id: String,
+    pub snapshot_json: String,
+    pub etag: String,
+    pub is_current: i64,
+    pub created_at: i64,
 }
