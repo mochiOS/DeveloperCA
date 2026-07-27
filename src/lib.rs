@@ -9,12 +9,35 @@ use serde::Serialize;
 use serde_json::json;
 use worker::*;
 
+const STATUS_ORIGIN: &str = "https://status.mochios.org";
+
 fn now() -> i64 {
     (Date::now().as_millis() / 1000) as i64
 }
 
 fn json_response<T: Serialize>(value: &T, status: u16) -> Result<Response> {
     Ok(Response::from_json(value)?.with_status(status))
+}
+
+fn with_health_cors(mut response: Response) -> Result<Response> {
+    let headers = response.headers_mut();
+    headers.set("Access-Control-Allow-Origin", STATUS_ORIGIN)?;
+    headers.set("Access-Control-Allow-Methods", "GET, OPTIONS")?;
+    headers.set("Access-Control-Allow-Headers", "Content-Type")?;
+    headers.set("Access-Control-Max-Age", "3600")?;
+    headers.set("Cache-Control", "no-store")?;
+    headers.set("Vary", "Origin")?;
+    Ok(response)
+}
+
+fn health_response() -> Result<Response> {
+    with_health_cors(Response::from_json(
+        &json!({"status":"ok","service":"developer-ca"}),
+    )?)
+}
+
+fn health_preflight() -> Result<Response> {
+    with_health_cors(Response::empty()?.with_status(204))
 }
 
 fn error(code: &str, message: &str, status: u16) -> Result<Response> {
@@ -599,9 +622,8 @@ async fn admin_revoke(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     Router::new()
-        .get_async("/health", |_, _| async {
-            json_response(&json!({"status":"ok","service":"developer-ca"}), 200)
-        })
+        .get_async("/health", |_, _| async { health_response() })
+        .options_async("/health", |_, _| async { health_preflight() })
         .post_async("/v1/developers", create_developer)
         .get_async("/v1/developers", list_developers)
         .get_async("/v1/developers/:developer_id", get_developer)
