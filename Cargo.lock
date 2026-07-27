@@ -457,12 +457,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "mochios-certificate"
+version = "0.1.0"
+source = "git+https://github.com/mochiOS/syscalls?rev=ee6be939de4635824df7f50858d66391dd6ead41#ee6be939de4635824df7f50858d66391dd6ead41"
+dependencies = [
+ "ed25519-dalek",
+ "sha2",
+]
+
+[[package]]
 name = "mochios-developer-ca"
 version = "0.1.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
  "getrandom 0.4.3",
+ "mochios-certificate",
  "serde",
  "serde_json",
  "sha2",

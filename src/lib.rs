@@ -3,7 +3,7 @@ pub mod certificate;
 mod model;
 mod store;
 
-use certificate::{DeveloperCertificate, FORMAT_VERSION, SIGNATURE_ALGORITHM, UnsignedCertificate};
+use certificate::SIGNATURE_ALGORITHM;
 use model::*;
 use serde::Serialize;
 use serde_json::json;
@@ -339,8 +339,14 @@ async fn list_certificates(req: Request, ctx: RouteContext<()>) -> Result<Respon
 }
 
 fn certificate_view(row: CertificateRow) -> Result<serde_json::Value> {
-    let certificate: DeveloperCertificate = serde_json::from_str(&row.certificate_json)?;
-    Ok(json!({"id": row.id, "status": row.status, "certificate": certificate}))
+    let certificate =
+        certificate::decode_base64(&row.certificate_json).map_err(Error::RustError)?;
+    Ok(json!({
+        "id": row.id,
+        "status": row.status,
+        "certificate": certificate::view(&certificate),
+        "certificate_wire": row.certificate_json,
+    }))
 }
 
 async fn get_certificate(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -361,7 +367,7 @@ async fn trust_store(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
     json_response(
         &json!({
             "format_version": 1,
-            "issuers": [{"issuer_key_id": ctx.env.var("ISSUER_KEY_ID")?.to_string(), "signature_algorithm": SIGNATURE_ALGORITHM,
+            "issuers": [{"issuer_key_id": certificate::issuer_key_id(&key.verifying_key()), "signature_algorithm": SIGNATURE_ALGORITHM,
                          "public_key": certificate::encoded_public_key(&key.verifying_key())}]
         }),
         200,
@@ -385,18 +391,19 @@ async fn certificate_status(_req: Request, ctx: RouteContext<()>) -> Result<Resp
     };
     let key = certificate::signing_key(&ctx.env.secret("INTERMEDIATE_PRIVATE_KEY")?.to_string())
         .map_err(Error::RustError)?;
-    let parsed: DeveloperCertificate = serde_json::from_str(&row.certificate_json)?;
+    let parsed = certificate::decode_base64(&row.certificate_json).map_err(Error::RustError)?;
+    let issuer_key_id = certificate::issuer_key_id(&key.verifying_key());
     let valid = row.status == "active"
         && developer.status == "active"
         && developer.verification_status == "verified"
-        && parsed.content.developer_id == row.developer_id
-        && parsed.content.serial_number == row.serial_number
-        && parsed.content.issuer_key_id == row.issuer_key_id
-        && parsed.content.subject_key_id == row.subject_key_id
-        && parsed.content.not_before == row.not_before
-        && parsed.content.not_after == row.not_after
-        && parsed.content.issuer_key_id == ctx.env.var("ISSUER_KEY_ID")?.to_string()
-        && parsed.verify(&key.verifying_key(), now()).is_ok();
+        && parsed.developer_id == row.developer_id
+        && parsed.serial_number.to_string() == row.serial_number
+        && certificate::hex(&parsed.issuer_key_id) == row.issuer_key_id
+        && certificate::hex(&parsed.subject_key_id) == row.subject_key_id
+        && parsed.not_before == row.not_before as u64
+        && parsed.not_after == row.not_after as u64
+        && row.issuer_key_id == issuer_key_id
+        && certificate::verify(&parsed, &key.verifying_key().to_bytes(), now() as u64).is_ok();
     json_response(
         &json!({"certificate_id": certificate_id, "status": if valid {"valid"} else {"invalid"}, "valid": valid}),
         200,
@@ -539,13 +546,10 @@ async fn admin_issue(req: Request, ctx: RouteContext<()>) -> Result<Response> {
             409,
         );
     }
-    let mut serial_bytes = [0_u8; 16];
+    let mut serial_bytes = [0_u8; 8];
     getrandom::fill(&mut serial_bytes)
         .map_err(|_| Error::RustError("secure random generation failed".into()))?;
-    let serial = serial_bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let serial = u64::from_le_bytes(serial_bytes).max(1);
     let issued_at = now();
     let certificate_id = store::id(issued_at);
     let ttl = ctx
@@ -554,7 +558,9 @@ async fn admin_issue(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .to_string()
         .parse::<i64>()
         .unwrap_or(31_536_000);
-    let issuer_key_id = ctx.env.var("ISSUER_KEY_ID")?.to_string();
+    let key = certificate::signing_key(&ctx.env.secret("INTERMEDIATE_PRIVATE_KEY")?.to_string())
+        .map_err(Error::RustError)?;
+    let issuer_key_id = certificate::issuer_key_id(&key.verifying_key());
     let input = certificate::CertificateRequestInput {
         signature_algorithm: request.signature_algorithm.clone(),
         subject_public_key: request.subject_public_key.clone(),
@@ -562,31 +568,26 @@ async fn admin_issue(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         allowed_capabilities: serde_json::from_str(&request.allowed_capabilities_json)?,
     };
     input.validate().map_err(Error::RustError)?;
-    let content = UnsignedCertificate {
-        format_version: FORMAT_VERSION,
-        serial_number: serial.clone(),
-        issuer_key_id: issuer_key_id.clone(),
-        developer_id: request.developer_id.clone(),
-        subject_key_id: request.subject_key_id.clone(),
-        subject_public_key: request.subject_public_key.clone(),
-        not_before: issued_at,
-        not_after: issued_at + ttl.max(60),
-        key_usage: vec!["manifest-signing".into()],
-        package_id_scopes: input.package_id_scopes,
-        allowed_capabilities: input.allowed_capabilities,
-        signature_algorithm: SIGNATURE_ALGORITHM.into(),
-    };
-    let key = certificate::signing_key(&ctx.env.secret("INTERMEDIATE_PRIVATE_KEY")?.to_string())
-        .map_err(Error::RustError)?;
-    let certificate = DeveloperCertificate::issue(content, &key).map_err(Error::RustError)?;
+    let wire = certificate::issue(
+        certificate::IssueCertificate {
+            serial_number: serial,
+            developer_id: &request.developer_id,
+            not_before: issued_at as u64,
+            not_after: (issued_at + ttl.max(60)) as u64,
+            request: &input,
+        },
+        &key,
+    )
+    .map_err(Error::RustError)?;
+    let certificate_wire = certificate::encode_base64(&wire);
     let row = store::issue_certificate(
         &ctx.env.d1("DB")?,
         &request,
         store::IssuedCertificateRecord {
             certificate_id: &certificate_id,
-            serial: &serial,
+            serial: &serial.to_string(),
             issuer: &issuer_key_id,
-            certificate_json: &serde_json::to_string(&certificate)?,
+            certificate_json: &certificate_wire,
             not_before: issued_at,
             not_after: issued_at + ttl.max(60),
             actor: &actor,

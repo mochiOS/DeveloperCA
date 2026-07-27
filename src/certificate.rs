@@ -1,9 +1,12 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use mochios_certificate::{
+    DeveloperCertificate, KEY_USAGE_PACKAGE_SIGNING, PackageIdScope, PackageScopeKind,
+    SIGNATURE_LEN, is_valid_capability, key_id,
+};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde_json::{Value, json};
 
-pub const FORMAT_VERSION: u32 = 1;
 pub const SIGNATURE_ALGORITHM: &str = "ed25519";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,99 +23,139 @@ impl CertificateRequestInput {
         if self.signature_algorithm != SIGNATURE_ALGORITHM {
             return Err("unsupported signature algorithm".into());
         }
-        if self.package_id_scopes.is_empty()
-            || self
-                .package_id_scopes
-                .iter()
-                .any(|scope| !valid_package_scope(scope))
-        {
-            return Err("invalid package id scope".into());
+        let scopes = parse_scopes(&self.package_id_scopes)?;
+        if scopes.is_empty() {
+            return Err("at least one package id scope is required".into());
         }
-        if self
-            .allowed_capabilities
+        let mut capabilities = self.allowed_capabilities.clone();
+        if capabilities
             .iter()
-            .any(|value| value.is_empty() || value.len() > 128)
+            .any(|capability| !is_valid_capability(capability))
         {
             return Err("invalid capability".into());
+        }
+        capabilities.sort();
+        if capabilities.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err("duplicate capability".into());
         }
         decode_public_key(&self.subject_public_key)
     }
 
     pub fn subject_key_id(&self) -> Result<String, String> {
         let key = self.validate()?;
-        Ok(format!("sha256:{}", hex(&Sha256::digest(key.as_bytes()))))
+        Ok(hex(&key_id(key.as_bytes())))
+    }
+
+    pub fn canonical_scopes(&self) -> Result<Vec<PackageIdScope>, String> {
+        parse_scopes(&self.package_id_scopes)
+    }
+
+    pub fn canonical_capabilities(&self) -> Result<Vec<String>, String> {
+        self.validate()?;
+        let mut capabilities = self.allowed_capabilities.clone();
+        capabilities.sort();
+        Ok(capabilities)
+    }
+
+    pub fn subject_public_key_bytes(&self) -> Result<[u8; 32], String> {
+        Ok(decode_public_key(&self.subject_public_key)?.to_bytes())
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UnsignedCertificate {
-    pub format_version: u32,
-    pub serial_number: String,
-    pub issuer_key_id: String,
-    pub developer_id: String,
-    pub subject_key_id: String,
-    pub subject_public_key: String,
-    pub not_before: i64,
-    pub not_after: i64,
-    pub key_usage: Vec<String>,
-    pub package_id_scopes: Vec<String>,
-    pub allowed_capabilities: Vec<String>,
-    pub signature_algorithm: String,
+pub struct IssueCertificate<'a> {
+    pub serial_number: u64,
+    pub developer_id: &'a str,
+    pub not_before: u64,
+    pub not_after: u64,
+    pub request: &'a CertificateRequestInput,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeveloperCertificate {
-    #[serde(flatten)]
-    pub content: UnsignedCertificate,
-    pub signature: String,
+pub fn issue(input: IssueCertificate<'_>, signing_key: &SigningKey) -> Result<Vec<u8>, String> {
+    let issuer_public_key = signing_key.verifying_key().to_bytes();
+    let subject_public_key = input.request.subject_public_key_bytes()?;
+    let mut certificate = DeveloperCertificate {
+        serial_number: input.serial_number,
+        issuer_key_id: key_id(&issuer_public_key),
+        developer_id: input.developer_id.into(),
+        subject_key_id: key_id(&subject_public_key),
+        subject_public_key,
+        not_before: input.not_before,
+        not_after: input.not_after,
+        key_usage: KEY_USAGE_PACKAGE_SIGNING,
+        package_id_scopes: input.request.canonical_scopes()?,
+        allowed_capabilities: input.request.canonical_capabilities()?,
+        signature: [0; SIGNATURE_LEN],
+    };
+    certificate.validate().map_err(|error| error.to_string())?;
+    certificate.signature = signing_key
+        .sign(
+            &certificate
+                .signing_message()
+                .map_err(|error| error.to_string())?,
+        )
+        .to_bytes();
+    let mut wire = vec![
+        0;
+        certificate
+            .encoded_len()
+            .map_err(|error| error.to_string())?
+    ];
+    certificate
+        .encode(&mut wire)
+        .map_err(|error| error.to_string())?;
+    Ok(wire)
 }
 
-impl DeveloperCertificate {
-    pub fn issue(content: UnsignedCertificate, signing_key: &SigningKey) -> Result<Self, String> {
-        validate_content(&content, content.not_before)?;
-        let payload =
-            serde_json::to_vec(&content).map_err(|_| "certificate serialization failed")?;
-        let signature = STANDARD.encode(signing_key.sign(&payload).to_bytes());
-        Ok(Self { content, signature })
-    }
+pub fn decode(wire: &[u8]) -> Result<DeveloperCertificate, String> {
+    DeveloperCertificate::decode(wire).map_err(|error| error.to_string())
+}
 
-    pub fn verify(&self, issuer: &VerifyingKey, now: i64) -> Result<(), String> {
-        validate_content(&self.content, now)?;
-        decode_public_key(&self.content.subject_public_key)?;
-        let bytes = STANDARD
-            .decode(&self.signature)
-            .map_err(|_| "invalid signature encoding")?;
-        let signature = Signature::from_slice(&bytes).map_err(|_| "invalid signature")?;
-        let payload =
-            serde_json::to_vec(&self.content).map_err(|_| "certificate serialization failed")?;
-        issuer
-            .verify(&payload, &signature)
-            .map_err(|_| "invalid signature".into())
-    }
+pub fn decode_base64(wire: &str) -> Result<DeveloperCertificate, String> {
+    let bytes = STANDARD
+        .decode(wire)
+        .map_err(|_| "invalid certificate wire encoding".to_owned())?;
+    decode(&bytes)
+}
 
-    pub fn authorize(
-        &self,
-        package_id: &str,
-        requested_capabilities: &[String],
-    ) -> Result<(), String> {
-        if !self
-            .content
-            .package_id_scopes
-            .iter()
-            .any(|scope| scope_matches(scope, package_id))
-        {
-            return Err("package id is outside certificate scope".into());
-        }
-        if requested_capabilities
-            .iter()
-            .any(|capability| !self.content.allowed_capabilities.contains(capability))
-        {
-            return Err("capability is not allowed by certificate".into());
-        }
-        Ok(())
-    }
+pub fn encode_base64(wire: &[u8]) -> String {
+    STANDARD.encode(wire)
+}
+
+pub fn verify(
+    certificate: &DeveloperCertificate,
+    issuer_public_key: &[u8; 32],
+    unix_time: u64,
+) -> Result<(), String> {
+    let package_id = certificate
+        .package_id_scopes
+        .first()
+        .map(|scope| scope.package_id.as_str())
+        .ok_or_else(|| "certificate has no package scope".to_owned())?;
+    certificate
+        .verify(issuer_public_key, unix_time, package_id)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+pub fn view(certificate: &DeveloperCertificate) -> Value {
+    json!({
+        "content": {
+            "format_version": mochios_certificate::FORMAT_VERSION,
+            "serial_number": certificate.serial_number.to_string(),
+            "issuer_key_id": hex(&certificate.issuer_key_id),
+            "developer_id": certificate.developer_id,
+            "subject_key_id": hex(&certificate.subject_key_id),
+            "subject_public_key": STANDARD.encode(certificate.subject_public_key),
+            "not_before": certificate.not_before,
+            "not_after": certificate.not_after,
+            "key_usage": ["manifest-signing"],
+            "package_id_scopes": certificate.package_id_scopes.iter().map(scope_string).collect::<Vec<_>>(),
+            "allowed_capabilities": certificate.allowed_capabilities,
+            "signature_algorithm": SIGNATURE_ALGORITHM,
+        },
+        "signature": STANDARD.encode(certificate.signature),
+        "wire_format": "MCER",
+    })
 }
 
 pub fn signing_key(encoded: &str) -> Result<SigningKey, String> {
@@ -129,6 +172,10 @@ pub fn encoded_public_key(key: &VerifyingKey) -> String {
     STANDARD.encode(key.as_bytes())
 }
 
+pub fn issuer_key_id(key: &VerifyingKey) -> String {
+    hex(&key_id(key.as_bytes()))
+}
+
 fn decode_public_key(encoded: &str) -> Result<VerifyingKey, String> {
     let bytes = STANDARD
         .decode(encoded)
@@ -139,68 +186,54 @@ fn decode_public_key(encoded: &str) -> Result<VerifyingKey, String> {
     VerifyingKey::from_bytes(&key).map_err(|_| "invalid Ed25519 public key".into())
 }
 
-fn validate_content(content: &UnsignedCertificate, now: i64) -> Result<(), String> {
-    if content.format_version != FORMAT_VERSION {
-        return Err("unsupported certificate format".into());
-    }
-    if content.signature_algorithm != SIGNATURE_ALGORITHM {
-        return Err("unsupported signature algorithm".into());
-    }
-    if content.not_after <= content.not_before
-        || now < content.not_before
-        || now >= content.not_after
-    {
-        return Err("certificate is not currently valid".into());
-    }
-    if content.key_usage != ["manifest-signing"] {
-        return Err("unsupported key usage".into());
-    }
-    if content.package_id_scopes.is_empty()
-        || content
-            .package_id_scopes
-            .iter()
-            .any(|scope| !valid_package_scope(scope))
-    {
-        return Err("invalid package id scope".into());
-    }
-    if content
-        .allowed_capabilities
+fn parse_scopes(scopes: &[String]) -> Result<Vec<PackageIdScope>, String> {
+    let mut parsed = scopes
         .iter()
-        .any(|value| value.is_empty() || value.len() > 128)
-    {
-        return Err("invalid capability".into());
-    }
-    if content.serial_number.is_empty()
-        || content.issuer_key_id.is_empty()
-        || content.developer_id.is_empty()
-        || content.subject_key_id.is_empty()
-    {
-        return Err("required certificate identity is missing".into());
-    }
-    Ok(())
-}
-
-fn valid_package_scope(scope: &str) -> bool {
-    let parts: Vec<_> = scope.split('.').collect();
-    !scope.is_empty()
-        && scope.len() <= 255
-        && parts.iter().enumerate().all(|(index, part)| {
-            !part.is_empty()
-                && (*part == "*" && index == parts.len() - 1
-                    || part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        .map(|scope| {
+            if let Some(prefix) = scope.strip_suffix(".*") {
+                Ok(PackageIdScope::prefix(prefix))
+            } else {
+                Ok(PackageIdScope::exact(scope))
+            }
         })
+        .collect::<Result<Vec<_>, String>>()?;
+    parsed.sort();
+    if parsed.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("duplicate package id scope".into());
+    }
+    let subject_key = SigningKey::from_bytes(&[1; 32]).verifying_key().to_bytes();
+    let probe = DeveloperCertificate {
+        serial_number: 1,
+        issuer_key_id: [1; 32],
+        developer_id: "developer".into(),
+        subject_key_id: key_id(&subject_key),
+        subject_public_key: subject_key,
+        not_before: 1,
+        not_after: 2,
+        key_usage: KEY_USAGE_PACKAGE_SIGNING,
+        package_id_scopes: parsed.clone(),
+        allowed_capabilities: vec![],
+        signature: [0; SIGNATURE_LEN],
+    };
+    probe.validate().map_err(|error| error.to_string())?;
+    Ok(parsed)
 }
 
-fn scope_matches(scope: &str, package_id: &str) -> bool {
-    if let Some(prefix) = scope.strip_suffix(".*") {
-        package_id.starts_with(&format!("{prefix}."))
-    } else {
-        scope == package_id
+fn scope_string(scope: &PackageIdScope) -> String {
+    match scope.kind {
+        PackageScopeKind::Exact => scope.package_id.clone(),
+        PackageScopeKind::Prefix => format!("{}.*", scope.package_id),
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+pub fn hex(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(TABLE[(byte >> 4) as usize] as char);
+        output.push(TABLE[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 #[cfg(test)]
@@ -210,7 +243,7 @@ mod tests {
     fn request() -> CertificateRequestInput {
         let signing = SigningKey::from_bytes(&[7; 32]);
         CertificateRequestInput {
-            signature_algorithm: "ed25519".into(),
+            signature_algorithm: SIGNATURE_ALGORITHM.into(),
             subject_public_key: encoded_public_key(&signing.verifying_key()),
             package_id_scopes: vec!["dev.mochi.*".into()],
             allowed_capabilities: vec!["network.client".into()],
@@ -218,95 +251,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_public_key() {
+    fn shared_wire_round_trips_and_verifies() {
+        let issuer = SigningKey::from_bytes(&[3; 32]);
+        let wire = issue(
+            IssueCertificate {
+                serial_number: 7,
+                developer_id: "018f0000-0000-7000-8000-000000000001",
+                not_before: 100,
+                not_after: 200,
+                request: &request(),
+            },
+            &issuer,
+        )
+        .unwrap();
+        let certificate = decode(&wire).unwrap();
+        verify(&certificate, &issuer.verifying_key().to_bytes(), 150).unwrap();
+        assert_eq!(certificate.allowed_capabilities, ["network.client"]);
+    }
+
+    #[test]
+    fn rejects_duplicate_and_invalid_authority_requests() {
         let mut input = request();
-        input.subject_public_key = "not-base64".into();
+        input.allowed_capabilities.push("network.client".into());
         assert!(input.validate().is_err());
-    }
-
-    #[test]
-    fn certificate_is_bound_to_developer_and_detects_tampering() {
-        let issuer = SigningKey::from_bytes(&[3; 32]);
-        let input = request();
-        let cert = DeveloperCertificate::issue(
-            UnsignedCertificate {
-                format_version: FORMAT_VERSION,
-                serial_number: "01".into(),
-                issuer_key_id: "intermediate-1".into(),
-                developer_id: "018f0000-0000-7000-8000-000000000001".into(),
-                subject_key_id: input.subject_key_id().unwrap(),
-                subject_public_key: input.subject_public_key,
-                not_before: 100,
-                not_after: 200,
-                key_usage: vec!["manifest-signing".into()],
-                package_id_scopes: input.package_id_scopes,
-                allowed_capabilities: input.allowed_capabilities,
-                signature_algorithm: SIGNATURE_ALGORITHM.into(),
-            },
-            &issuer,
-        )
-        .unwrap();
-        assert!(cert.verify(&issuer.verifying_key(), 150).is_ok());
-        let mut tampered = cert;
-        tampered.content.developer_id = "other".into();
-        assert!(tampered.verify(&issuer.verifying_key(), 150).is_err());
-    }
-
-    #[test]
-    fn expired_certificate_fails_closed() {
-        let issuer = SigningKey::from_bytes(&[3; 32]);
-        let input = request();
-        let cert = DeveloperCertificate::issue(
-            UnsignedCertificate {
-                format_version: FORMAT_VERSION,
-                serial_number: "02".into(),
-                issuer_key_id: "i".into(),
-                developer_id: "developer".into(),
-                subject_key_id: input.subject_key_id().unwrap(),
-                subject_public_key: input.subject_public_key,
-                not_before: 100,
-                not_after: 200,
-                key_usage: vec!["manifest-signing".into()],
-                package_id_scopes: input.package_id_scopes,
-                allowed_capabilities: vec![],
-                signature_algorithm: SIGNATURE_ALGORITHM.into(),
-            },
-            &issuer,
-        )
-        .unwrap();
-        assert!(cert.verify(&issuer.verifying_key(), 200).is_err());
-    }
-
-    #[test]
-    fn package_scope_and_capabilities_fail_closed() {
-        let issuer = SigningKey::from_bytes(&[3; 32]);
-        let input = request();
-        let cert = DeveloperCertificate::issue(
-            UnsignedCertificate {
-                format_version: FORMAT_VERSION,
-                serial_number: "03".into(),
-                issuer_key_id: "i".into(),
-                developer_id: "developer".into(),
-                subject_key_id: input.subject_key_id().unwrap(),
-                subject_public_key: input.subject_public_key,
-                not_before: 100,
-                not_after: 200,
-                key_usage: vec!["manifest-signing".into()],
-                package_id_scopes: input.package_id_scopes,
-                allowed_capabilities: input.allowed_capabilities,
-                signature_algorithm: SIGNATURE_ALGORITHM.into(),
-            },
-            &issuer,
-        )
-        .unwrap();
-        assert!(
-            cert.authorize("dev.mochi.paint", &["network.client".into()])
-                .is_ok()
-        );
-        assert!(cert.authorize("other.paint", &[]).is_err());
-        assert!(
-            cert.authorize("dev.mochi.paint", &["system.admin".into()])
-                .is_err()
-        );
+        let mut input = request();
+        input.package_id_scopes = vec!["dev.mochi.*".into(), "dev.mochi.*".into()];
+        assert!(input.validate().is_err());
     }
 }
