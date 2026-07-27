@@ -1,11 +1,14 @@
 # mochiOS DeveloperCA
 
 DeveloperCAは、Developerアカウント、署名証明書、Issuer Registry、署名付きtrust
-snapshot、署名付き失効snapshot、発行Policyを管理するCloudflare Workerです。Rustと
+snapshot、署名付き失効snapshotを管理するCloudflare Workerです。Rustと
 `workers-rs`で実装し、状態はD1へ保存します。MPKG本体やアプリ本体は保存しません。
 
 Developer Certificateのwire形式と検証規則は、`mochios-certificate`共有crateを正本に
 します。DeveloperCA内の`certificate.rs`はAPIとの変換だけを行う薄いadapterです。
+Certificateは、確認済みDeveloperのactiveなowner、admin、developerが公開鍵とmanifest
+由来のPackage ID／Capabilityを送ると即時発行します。管理者による発行審査はなく、
+管理者のCertificate操作は失効だけです。
 
 ## ローカル確認
 

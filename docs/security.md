@@ -6,10 +6,12 @@
 - 重要操作は`jti`を一度だけ受理し、監査ログにも記録します。
 - Offline Root秘密鍵をWorker、D1、CI、ログへ置きません。
 - Online鍵はRoot署名snapshotとIssuer Registryの両方に一致するときだけ使用します。
-- scopeとCapabilityは申請値、Developer grant、global policyを発行直前とD1 batch内で照合します。
+- scopeとCapabilityは共有Certificate形式の厳格な文字列・件数・重複検証を通します。
+- 発行直前とD1 batch内の両方で、Developer状態とactive member roleを再確認します。
 - snapshotとCertificateには厳格な件数・byte数・文字列長上限があります。
 - SQL値はprepared statementへbindし、snapshotと監査ログは追記専用です。
 
-ConsoleのブラウザMPKG解析は入力補助です。ブラウザから送られたscopeやCapabilityを信頼
-せず、DeveloperCAがPolicyを再検証します。`fs.read.all`、`process.spawn`、
-`window.overlay`のような強いCapabilityをmanifestだけでglobal許可にしてはいけません。
+ConsoleはMPKG本体を送信せず、端末内で抽出したmanifest値だけを送ります。Developer
+Certificateは「管理者がCapabilityを承認した」という意味ではなく、確認済みDeveloperの
+公開鍵と署名可能範囲を暗号学的に結び付けるものです。実行時Capability認可とApp Store審査は
+Certificate発行とは別の信頼境界です。

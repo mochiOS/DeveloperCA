@@ -24,5 +24,6 @@ Online Intermediate秘密鍵だけを保持します。発行と失効snapshot�
 基盤のadmin tokenを使用し、actorは`sub`だけから決定します。
 
 ConsoleのMPKG選択UIは端末内で`manifest.toml`を読み、`package.id`と全
-`binary.requires`を申請候補へ自動反映します。これは入力支援であり信頼境界では
-ありません。発行時はD1 Policyとactive memberをDeveloperCAが再検証します。
+`binary.requires`をCertificateへ自動反映します。DeveloperCAは入力形式、確認済みかつ
+activeなDeveloper、active member role、Root署名済みtrust snapshot、Issuer Registryを
+検証し、同じリクエスト内で即時発行します。管理者によるissue/reject段階はありません。

@@ -1,4 +1,4 @@
-# Package scopeとCapability Policy
+# Certificate自動発行
 
 Consoleは`.mpkg`内の`manifest.toml`から次を自動入力します。
 
@@ -7,13 +7,18 @@ Consoleは`.mpkg`内の`manifest.toml`から次を自動入力します。
 [[binary]].requires[] -> requested Capabilityの和集合
 ```
 
-発行値は申請値をそのまま採用せず、次の全条件を満たす場合だけ申請全体を発行します。
+DeveloperCAは次の全条件を満たす場合、管理者審査を挟まず同じHTTPリクエスト内で
+Certificateを発行します。
 
 ```text
-Package scope = requested ∩ active Developer package-scope grant
-Capability    = requested ∩ active Developer capability grant ∩ active global capability
+Developer       = activeかつverified
+Requester       = active memberかつowner/admin/developer
+Issuer          = Root署名trust snapshotとIssuer Registryの両方でactive
+Package scope   = 共有Certificate形式で妥当
+Capability      = 共有Certificate形式で妥当、重複なし
 ```
 
-1件でも外れる場合は縮小発行せず、申請全体を拒否します。審査画面には不足grantを表示し、
-審査者がDeveloper許可とglobal許可を別々に操作します。申請後にgrant、Developer、member
-roleが変更された場合も、発行直前とD1保存batch内の再検証で拒否します。
+発行前の確認に加えて、申請行・証明書行・監査ログを保存するD1 batch内でもDeveloperと
+memberを再検証します。管理APIにはCertificate issue/reject routeを公開せず、active
+Certificateのrevokeだけを公開します。Certificateに含まれるCapabilityは管理者承認を
+意味せず、OS実行時認可とApp Store審査は別途行います。
