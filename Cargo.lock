@@ -473,12 +473,23 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
  "mochios-certificate",
+ "mochios-developer-ca-trust",
  "serde",
  "serde_json",
  "sha2",
  "subtle",
  "uuid",
  "worker",
+]
+
+[[package]]
+name = "mochios-developer-ca-trust"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ed25519-dalek",
+ "serde",
+ "sha2",
 ]
 
 [[package]]

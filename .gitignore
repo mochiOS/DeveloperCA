@@ -1,6 +1,7 @@
 /build/
 /target/
+**/target/
+crates/*/Cargo.lock
 /.dev.vars
 /.wrangler/
 /local-ca/
-

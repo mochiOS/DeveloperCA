@@ -13,6 +13,7 @@ base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 mochios-certificate = { git = "https://github.com/mochiOS/syscalls", rev = "ee6be939de4635824df7f50858d66391dd6ead41" }
+mochios-developer-ca-trust = { path = "crates/trust" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
