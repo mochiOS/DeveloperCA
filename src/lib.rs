@@ -793,6 +793,10 @@ async fn certificate_status(_req: Request, ctx: RouteContext<()>) -> Result<Resp
                 "developer_id": parsed.developer_id,
                 "developer_record_id": row.developer_id,
                 "subject_key_id": certificate::hex(&parsed.subject_key_id),
+                "subject_public_key": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    parsed.subject_public_key,
+                ),
                 "issuer_key_id": certificate::hex(&parsed.issuer_key_id),
                 "issuer_public_key": base64::Engine::encode(
                     &base64::engine::general_purpose::STANDARD,
