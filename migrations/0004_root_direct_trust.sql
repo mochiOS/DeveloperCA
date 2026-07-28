@@ -1,3 +1,2 @@
-DROP TABLE revocation_snapshots;
-DROP TABLE trust_snapshots;
-DROP TABLE issuers;
+-- Historical compatibility migration.
+-- Issuer and trust state must remain intact for the Online Intermediate flow.

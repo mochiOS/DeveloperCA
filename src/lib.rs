@@ -3,13 +3,22 @@ pub mod certificate;
 mod model;
 mod store;
 
-use crate::model::RevocationReasonCode;
+use mochios_developer_ca_trust::{
+    IssuerStatus, MAX_SNAPSHOT_BYTES, REVOCATION_FORMAT_VERSION, RevocationReasonCode,
+    RevocationSnapshot as SignedRevocationSnapshot, SIGNATURE_ALGORITHM, SnapshotRevocation,
+    TrustSnapshot, UnsignedRevocationSnapshot,
+};
 use model::*;
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use worker::*;
 
 const STATUS_ORIGIN: &str = "https://status.mochios.org";
+const MAX_CERTIFICATE_ISSUE_BODY_BYTES: usize = 16 * 1024;
+const MAX_CERTIFICATE_CAPABILITIES: usize = 512;
+const DEFAULT_CERTIFICATE_TTL_SECONDS: i64 = 31_536_000;
+const MAX_CERTIFICATE_TTL_SECONDS: i64 = 31_536_000;
 
 fn now() -> i64 {
     (Date::now().as_millis() / 1000) as i64
@@ -67,11 +76,30 @@ fn can_request_certificate(role: &str) -> bool {
     matches!(role, "owner" | "admin" | "developer")
 }
 
-fn root_public_keys(env: &Env) -> Option<Vec<[u8; 32]>> {
-    env.secret("MOCHIOS_ROOT_PUBLIC_KEYS_HEX")
-        .or_else(|_| env.secret("OFFLINE_ROOT_PUBLIC_KEY"))
-        .ok()
-        .and_then(|value| certificate::root_public_keys(&value.to_string()).ok())
+fn valid_idempotency_key(value: &str) -> bool {
+    (16..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn certificate_request_hash(
+    developer: &Developer,
+    request: &certificate::CertificateRequestInput,
+) -> std::result::Result<String, String> {
+    let canonical = serde_json::to_vec(&json!({
+        "developer_id": developer.certificate_developer_id,
+        "subject_public_key": certificate::encoded_public_key(&request.validate()?),
+        "package_id_scopes": request.canonical_scopes()?.iter().map(|scope| {
+            match scope.kind {
+                mochios_certificate::PackageScopeKind::Exact => scope.package_id.clone(),
+                mochios_certificate::PackageScopeKind::Prefix => format!("{}.*", scope.package_id),
+            }
+        }).collect::<Vec<_>>(),
+        "capabilities": request.canonical_capabilities()?,
+    }))
+    .map_err(|error| error.to_string())?;
+    Ok(certificate::hex(&Sha256::digest(canonical)))
 }
 
 async fn user(req: &Request, env: &Env) -> Result<Option<String>> {
@@ -303,7 +331,7 @@ async fn list_creation_requests(req: Request, ctx: RouteContext<()>) -> Result<R
     )
 }
 
-async fn register_certificate(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
+async fn issue_certificate(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let developer_id = param(&ctx, "developer_id");
     let Some(member) = membership(&req, &ctx, developer_id).await? else {
         return error("FORBIDDEN", "Active membership required", 403);
@@ -311,91 +339,239 @@ async fn register_certificate(mut req: Request, ctx: RouteContext<()>) -> Result
     if !can_request_certificate(&member.role) {
         return error("FORBIDDEN", "Role cannot request certificates", 403);
     }
-    let input: certificate::CertificateRegistrationInput = req.json().await?;
-    let wire = match base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        input.certificate.trim(),
-    ) {
-        Ok(value)
-            if !value.is_empty() && value.len() <= mochios_certificate::MAX_CERTIFICATE_LEN =>
-        {
-            value
-        }
-        _ => {
+    let idempotency_key = req.headers().get("X-Idempotency-Key")?.unwrap_or_default();
+    if !valid_idempotency_key(&idempotency_key) {
+        return error(
+            "IDEMPOTENCY_KEY_INVALID",
+            "X-Idempotency-Key must contain 16 to 128 safe ASCII characters",
+            422,
+        );
+    }
+    if let Some(length) = req.headers().get("Content-Length")?
+        && length
+            .parse::<usize>()
+            .map_or(true, |length| length > MAX_CERTIFICATE_ISSUE_BODY_BYTES)
+    {
+        return error(
+            "REQUEST_BODY_TOO_LARGE",
+            "Certificate issue request body exceeds 16 KiB",
+            413,
+        );
+    }
+    let body = req.bytes().await?;
+    if body.len() > MAX_CERTIFICATE_ISSUE_BODY_BYTES {
+        return error(
+            "REQUEST_BODY_TOO_LARGE",
+            "Certificate issue request body exceeds 16 KiB",
+            413,
+        );
+    }
+    let input: certificate::CertificateIssueInput = match serde_json::from_slice(&body) {
+        Ok(input) => input,
+        Err(_) => {
             return error(
-                "CERTIFICATE_INVALID",
-                "Certificate must be a Base64 MCER v1 value",
+                "CERTIFICATE_REQUEST_INVALID",
+                "Certificate issue request must be valid JSON with no unknown fields",
                 422,
             );
         }
     };
-    let parsed = match certificate::decode(&wire) {
-        Ok(value) => value,
-        Err(reason) => return error("CERTIFICATE_INVALID", &reason, 422),
+    if input.capabilities.len() > MAX_CERTIFICATE_CAPABILITIES {
+        return error(
+            "CERTIFICATE_REQUEST_INVALID",
+            "Certificate issue request contains too many capabilities",
+            422,
+        );
+    }
+    let input = match input.into_request() {
+        Ok(input) => input,
+        Err(reason) => return error("CERTIFICATE_REQUEST_INVALID", &reason, 422),
     };
-    let Some(developer) = store::developer(&ctx.env.d1("DB")?, developer_id).await? else {
+    if let Err(reason) = input.validate() {
+        return error("CERTIFICATE_REQUEST_INVALID", &reason, 422);
+    }
+    let issued_at = now();
+    let db = ctx.env.d1("DB")?;
+    let Some(developer) = store::developer(&db, developer_id).await? else {
         return error("DEVELOPER_NOT_FOUND", "Developer not found", 404);
     };
-    if parsed.developer_id != developer.certificate_developer_id {
+    if developer.status != "active" || developer.verification_status != "verified" {
         return error(
-            "CERTIFICATE_DEVELOPER_MISMATCH",
-            "Certificate developer ID does not match",
-            422,
+            "DEVELOPER_NOT_ELIGIBLE",
+            "Developer must be active and verified",
+            409,
         );
     }
-    let root_keys = match root_public_keys(&ctx.env) {
-        Some(value) => value,
-        None => {
-            return error(
-                "ROOT_KEY_UNAVAILABLE",
-                "Root public key is unavailable",
-                503,
-            );
-        }
-    };
-    let Some(root_key) = root_keys
-        .iter()
-        .find(|key| mochios_certificate::key_id(key) == parsed.issuer_key_id)
-    else {
-        return error(
-            "CERTIFICATE_ISSUER_UNKNOWN",
-            "Certificate issuer is not trusted",
-            422,
-        );
-    };
-    let registered_at = now();
-    if let Err(reason) = certificate::verify(&parsed, root_key, registered_at as u64) {
-        return error("CERTIFICATE_INVALID", &reason, 422);
-    }
-    let request = certificate::request_from_certificate(&parsed);
-    let db = ctx.env.d1("DB")?;
-    let certificate_id = store::id(registered_at);
-    let request_id = store::id(registered_at);
-    let certificate_wire = certificate::encode_base64(&wire);
-    let row = store::register_certificate(
+    let request_hash = certificate_request_hash(&developer, &input)
+        .map_err(|reason| Error::RustError(format!("invalid certificate request: {reason}")))?;
+    match store::claim_certificate_issue(
         &db,
         developer_id,
         &member.account_id,
-        &request,
-        store::RegisteredCertificateRecord {
+        &idempotency_key,
+        &request_hash,
+        issued_at,
+    )
+    .await?
+    {
+        store::IssueClaim::Complete(row) => return json_response(&certificate_view(*row)?, 200),
+        store::IssueClaim::Conflict => {
+            return error(
+                "IDEMPOTENCY_KEY_CONFLICT",
+                "X-Idempotency-Key was already used for different certificate content",
+                409,
+            );
+        }
+        store::IssueClaim::Pending => {
+            return error(
+                "CERTIFICATE_ISSUANCE_PENDING",
+                "An identical certificate issue request is already in progress",
+                409,
+            );
+        }
+        store::IssueClaim::Claimed => {}
+    }
+    let subject_key_id = input
+        .subject_key_id()
+        .map_err(|reason| Error::RustError(format!("invalid certificate request: {reason}")))?;
+    if !store::record_certificate_issue_attempt(
+        &db,
+        &member.account_id,
+        developer_id,
+        &subject_key_id,
+        &request_hash,
+        issued_at,
+    )
+    .await?
+    {
+        store::abandon_certificate_issue(
+            &db,
+            developer_id,
+            &member.account_id,
+            &idempotency_key,
+            &request_hash,
+        )
+        .await?;
+        return error(
+            "CERTIFICATE_RATE_LIMITED",
+            "Certificate issue rate limit exceeded",
+            429,
+        );
+    }
+    let (key, issuer) = match active_certificate_signer(&ctx.env, &db, issued_at as u64).await? {
+        Ok(value) => value,
+        Err(value) => {
+            store::abandon_certificate_issue(
+                &db,
+                developer_id,
+                &member.account_id,
+                &idempotency_key,
+                &request_hash,
+            )
+            .await?;
+            return error(value.code, value.message, value.status);
+        }
+    };
+    let ttl = ctx
+        .env
+        .var("CERTIFICATE_TTL_SECONDS")
+        .ok()
+        .and_then(|value| value.to_string().parse::<i64>().ok())
+        .unwrap_or(DEFAULT_CERTIFICATE_TTL_SECONDS)
+        .clamp(60, MAX_CERTIFICATE_TTL_SECONDS);
+    let not_after = issued_at.saturating_add(ttl).min(issuer.not_after);
+    if not_after <= issued_at.saturating_add(59) {
+        store::abandon_certificate_issue(
+            &db,
+            developer_id,
+            &member.account_id,
+            &idempotency_key,
+            &request_hash,
+        )
+        .await?;
+        return error(
+            "ISSUER_VALIDITY_TOO_SHORT",
+            "The active Intermediate expires too soon to issue a certificate",
+            503,
+        );
+    }
+    let serial = match store::reserve_certificate_serial(&db).await {
+        Ok(serial) => serial,
+        Err(error_value) => {
+            store::abandon_certificate_issue(
+                &db,
+                developer_id,
+                &member.account_id,
+                &idempotency_key,
+                &request_hash,
+            )
+            .await?;
+            return Err(error_value);
+        }
+    };
+    let certificate_id = store::id(issued_at);
+    let request_id = store::id(issued_at);
+    let wire = match certificate::issue(
+        certificate::IssueCertificate {
+            serial_number: serial,
+            developer_id: &developer.certificate_developer_id,
+            not_before: issued_at as u64,
+            not_after: not_after as u64,
+            request: &input,
+        },
+        &key,
+    ) {
+        Ok(wire) => wire,
+        Err(reason) => {
+            store::abandon_certificate_issue(
+                &db,
+                developer_id,
+                &member.account_id,
+                &idempotency_key,
+                &request_hash,
+            )
+            .await?;
+            return Err(Error::RustError(reason));
+        }
+    };
+    let certificate_wire = certificate::encode_base64(&wire);
+    let row = store::issue_certificate(
+        &db,
+        developer_id,
+        &member.account_id,
+        &input,
+        store::IssuedCertificateRecord {
             request_id: &request_id,
             certificate_id: &certificate_id,
-            serial: &parsed.serial_number.to_string(),
-            issuer: &certificate::hex(&parsed.issuer_key_id),
+            serial: &serial.to_string(),
+            issuer: &issuer.key_id,
             certificate_json: &certificate_wire,
-            not_before: parsed.not_before as i64,
-            not_after: parsed.not_after as i64,
-            now: registered_at,
+            not_before: issued_at,
+            not_after,
+            now: issued_at,
+            request_hash: &request_hash,
+            idempotency_key: &idempotency_key,
+            issuance_source: "online_intermediate",
         },
     )
     .await?;
     match row {
         Some(row) => json_response(&certificate_view(row)?, 201),
-        None => error(
-            "DEVELOPER_NOT_ELIGIBLE",
-            "Developer must be active, verified, and registered by an eligible member",
-            409,
-        ),
+        None => {
+            store::abandon_certificate_issue(
+                &db,
+                developer_id,
+                &member.account_id,
+                &idempotency_key,
+                &request_hash,
+            )
+            .await?;
+            error(
+                "DEVELOPER_NOT_ELIGIBLE",
+                "Developer or membership changed before certificate issuance completed",
+                409,
+            )
+        }
     }
 }
 
@@ -416,9 +592,17 @@ fn certificate_view(row: CertificateRow) -> Result<serde_json::Value> {
         certificate::decode_base64(&row.certificate_json).map_err(Error::RustError)?;
     Ok(json!({
         "id": row.id,
-        "developer_id": row.developer_id,
+        "certificate_id": row.id,
         "status": row.status,
-        "certificate": certificate::view(&certificate),
+        "serial_number": certificate.serial_number,
+        "developer_id": certificate.developer_id,
+        "developer_record_id": row.developer_id,
+        "subject_key_id": certificate::hex(&certificate.subject_key_id),
+        "not_before": certificate.not_before,
+        "not_after": certificate.not_after,
+        "issuance_source": row.issuance_source,
+        "certificate": row.certificate_json,
+        "certificate_details": certificate::view(&certificate),
         "certificate_wire": row.certificate_json,
     }))
 }
@@ -435,53 +619,118 @@ async fn get_certificate(req: Request, ctx: RouteContext<()>) -> Result<Response
     }
 }
 
-async fn trust_store(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let keys = match root_public_keys(&ctx.env) {
-        Some(value) => value,
-        None => {
-            return error(
-                "ROOT_KEY_UNAVAILABLE",
-                "Root public key is unavailable",
-                503,
-            );
-        }
+fn snapshot_response(
+    request: &Request,
+    snapshot_json: String,
+    etag: &str,
+    cache_control: &str,
+) -> Result<Response> {
+    let quoted_etag = format!("\"{etag}\"");
+    let not_modified = request
+        .headers()
+        .get("If-None-Match")?
+        .is_some_and(|header| etag_matches(&header, &quoted_etag));
+    let mut response = if not_modified {
+        Response::empty()?.with_status(304)
+    } else {
+        Response::from_bytes(snapshot_json.into_bytes())?.with_status(200)
     };
-    let root_keys = keys
-        .iter()
-        .map(|key| json!({
-            "key_id": certificate::hex(&mochios_certificate::key_id(key)),
-            "public_key": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key),
-        }))
-        .collect::<Vec<_>>();
-    let mut response = Response::from_json(&json!({
-        "format": 1,
-        "trust_model": "root-direct",
-        "root_keys": root_keys,
-    }))?;
     response
         .headers_mut()
-        .set("Cache-Control", "public, max-age=300, must-revalidate")?;
+        .set("Content-Type", "application/json; charset=utf-8")?;
+    response.headers_mut().set("ETag", &quoted_etag)?;
+    response.headers_mut().set("Cache-Control", cache_control)?;
     Ok(response)
 }
 
-async fn revocations(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let records = store::revocations(&ctx.env.d1("DB")?).await?;
-    let mut serials = records
-        .iter()
-        .filter_map(|record| record.serial_number.parse::<u64>().ok())
-        .collect::<Vec<_>>();
-    serials.sort_unstable();
-    serials.dedup();
-    let mut response = Response::from_json(&json!({
-        "format": 1,
-        "generated_at": now(),
-        "certificate_serials": serials,
-        "distribution": "embed serials into signature.service with MOCHIOS_REVOKED_CERTIFICATE_SERIALS",
-    }))?;
-    response
-        .headers_mut()
-        .set("Cache-Control", "public, max-age=60, must-revalidate")?;
-    Ok(response)
+fn etag_matches(header: &str, quoted_etag: &str) -> bool {
+    header.split(',').map(str::trim).any(|candidate| {
+        candidate == "*"
+            || candidate == quoted_etag
+            || candidate
+                .strip_prefix("W/")
+                .is_some_and(|weak| weak == quoted_etag)
+    })
+}
+
+async fn trust_store(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let Some(snapshot) = store::current_trust_snapshot(&ctx.env.d1("DB")?).await? else {
+        return error(
+            "TRUST_SNAPSHOT_UNAVAILABLE",
+            "No verified trust snapshot is registered",
+            503,
+        );
+    };
+    snapshot_response(
+        &req,
+        snapshot.snapshot_json,
+        &snapshot.etag,
+        "public, max-age=300, must-revalidate",
+    )
+}
+
+async fn trust_store_version(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let version = match param(&ctx, "snapshot_version").parse::<i64>() {
+        Ok(version) if version > 0 => version,
+        _ => {
+            return error(
+                "SNAPSHOT_VERSION_INVALID",
+                "Snapshot version is invalid",
+                422,
+            );
+        }
+    };
+    let Some(snapshot) = store::trust_snapshot(&ctx.env.d1("DB")?, version).await? else {
+        return error("TRUST_SNAPSHOT_NOT_FOUND", "Trust snapshot not found", 404);
+    };
+    snapshot_response(
+        &req,
+        snapshot.snapshot_json,
+        &snapshot.etag,
+        "public, max-age=86400, immutable",
+    )
+}
+
+async fn revocations(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let Some(snapshot) = store::current_revocation_snapshot(&ctx.env.d1("DB")?).await? else {
+        return error(
+            "REVOCATION_SNAPSHOT_UNAVAILABLE",
+            "No signed revocation snapshot is available",
+            503,
+        );
+    };
+    snapshot_response(
+        &req,
+        snapshot.snapshot_json,
+        &snapshot.etag,
+        "public, max-age=60, must-revalidate",
+    )
+}
+
+async fn revocations_version(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let version = match param(&ctx, "snapshot_version").parse::<i64>() {
+        Ok(version) if version > 0 => version,
+        _ => {
+            return error(
+                "SNAPSHOT_VERSION_INVALID",
+                "Snapshot version is invalid",
+                422,
+            );
+        }
+    };
+    let Some(snapshot) = store::revocation_snapshot(&ctx.env.d1("DB")?, version).await? else {
+        return error(
+            "REVOCATION_SNAPSHOT_NOT_FOUND",
+            "Revocation snapshot not found",
+            404,
+        );
+    };
+    snapshot_response(
+        &req,
+        snapshot.snapshot_json,
+        &snapshot.etag,
+        "public, max-age=86400, immutable",
+    )
 }
 
 async fn certificate_status(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -522,7 +771,9 @@ async fn certificate_status(_req: Request, ctx: RouteContext<()>) -> Result<Resp
     let Ok(parsed) = certificate::decode_base64(&row.certificate_json) else {
         return invalid("SIGNATURE_INVALID");
     };
-    if parsed.developer_id != row.developer_id
+    let developer_id_matches = parsed.developer_id == developer.certificate_developer_id
+        || (row.issuance_source == "legacy_root" && parsed.developer_id == row.developer_id);
+    if !developer_id_matches
         || parsed.serial_number.to_string() != row.serial_number
         || certificate::hex(&parsed.issuer_key_id) != row.issuer_key_id
         || certificate::hex(&parsed.subject_key_id) != row.subject_key_id
@@ -531,23 +782,118 @@ async fn certificate_status(_req: Request, ctx: RouteContext<()>) -> Result<Resp
     {
         return invalid("METADATA_MISMATCH");
     }
-    let Some(root_public_key) = root_public_keys(&ctx.env).and_then(|keys| {
-        keys.into_iter()
-            .find(|key| mochios_certificate::key_id(key) == parsed.issuer_key_id)
-    }) else {
+    let valid_response = || {
+        json_response(
+            &json!({
+                "certificate_id": certificate_id,
+                "status": "valid",
+                "valid": true,
+                "reason": "VALID",
+                "serial_number": parsed.serial_number,
+                "developer_id": parsed.developer_id,
+                "developer_record_id": row.developer_id,
+                "subject_key_id": certificate::hex(&parsed.subject_key_id),
+                "issuer_key_id": certificate::hex(&parsed.issuer_key_id),
+                "not_before": parsed.not_before,
+                "not_after": parsed.not_after,
+                "issuance_source": row.issuance_source,
+                "certificate": row.certificate_json,
+            }),
+            200,
+        )
+    };
+    if row.issuance_source == "legacy_root" {
+        let Some(root_public_key) =
+            ctx.env
+                .secret("OFFLINE_ROOT_PUBLIC_KEY")
+                .ok()
+                .and_then(|value| {
+                    mochios_developer_ca_trust::decode_public_key(&value.to_string()).ok()
+                })
+        else {
+            return invalid("ISSUER_UNKNOWN");
+        };
+        if mochios_certificate::key_id(&root_public_key) != parsed.issuer_key_id {
+            return invalid("ISSUER_UNKNOWN");
+        }
+        if certificate::verify(&parsed, &root_public_key, at as u64).is_err() {
+            return invalid(if parsed.not_after <= at as u64 {
+                "CERTIFICATE_EXPIRED"
+            } else {
+                "SIGNATURE_INVALID"
+            });
+        }
+        return valid_response();
+    }
+    if row.issuance_source != "online_intermediate" {
+        return invalid("ISSUER_UNKNOWN");
+    }
+    let Some(trust_row) = store::current_trust_snapshot(&db).await? else {
         return invalid("ISSUER_UNKNOWN");
     };
-    if certificate::verify(&parsed, &root_public_key, at as u64).is_err() {
+    let Ok(trust): std::result::Result<TrustSnapshot, _> =
+        serde_json::from_str(&trust_row.snapshot_json)
+    else {
+        return invalid("ISSUER_UNKNOWN");
+    };
+    let Some(root_public_key) = ctx
+        .env
+        .secret("OFFLINE_ROOT_PUBLIC_KEY")
+        .ok()
+        .and_then(|value| mochios_developer_ca_trust::decode_public_key(&value.to_string()).ok())
+    else {
+        return invalid("ISSUER_UNKNOWN");
+    };
+    if trust.verify(&root_public_key, at as u64).is_err() {
+        return invalid("ISSUER_UNKNOWN");
+    }
+    let Some(signed_issuer) = trust
+        .content
+        .issuers
+        .iter()
+        .find(|issuer| issuer.issuer_key_id == row.issuer_key_id)
+    else {
+        return invalid("ISSUER_UNKNOWN");
+    };
+    if signed_issuer.status == IssuerStatus::Revoked {
+        return invalid("ISSUER_REVOKED");
+    }
+    if !matches!(
+        signed_issuer.status,
+        IssuerStatus::Active | IssuerStatus::Retired
+    ) || !signed_issuer
+        .allowed_key_usages
+        .iter()
+        .any(|usage| usage == "developer-certificate-signing")
+        || parsed.not_before < signed_issuer.not_before
+        || parsed.not_before >= signed_issuer.not_after
+    {
+        return invalid("ISSUER_UNKNOWN");
+    }
+    let Some(registry_issuer) = store::issuer(&db, &row.issuer_key_id).await? else {
+        return invalid("ISSUER_UNKNOWN");
+    };
+    if registry_issuer.status == "revoked" {
+        return invalid("ISSUER_REVOKED");
+    }
+    if registry_issuer.public_key != signed_issuer.public_key
+        || registry_issuer.status != signed_issuer.status.as_str()
+        || registry_issuer.trust_snapshot_version != trust_row.snapshot_version
+    {
+        return invalid("METADATA_MISMATCH");
+    }
+    let Ok(public_key) = mochios_developer_ca_trust::decode_public_key(&registry_issuer.public_key)
+    else {
+        return invalid("ISSUER_UNKNOWN");
+    };
+    if certificate::verify(&parsed, &public_key, at as u64).is_err() {
         return invalid(if parsed.not_after <= at as u64 {
             "CERTIFICATE_EXPIRED"
         } else {
             "SIGNATURE_INVALID"
         });
     }
-    json_response(
-        &json!({"certificate_id": certificate_id, "status": "valid", "valid": true, "reason": "VALID"}),
-        200,
-    )
+    valid_response()
 }
 
 async fn require_admin(req: &Request, env: &Env) -> Result<Option<auth::AdminActor>> {
@@ -568,6 +914,245 @@ async fn consume_admin_action(
         now(),
     )
     .await
+}
+
+fn transition_allowed(previous: &str, next: IssuerStatus) -> bool {
+    matches!(
+        (previous, next),
+        (
+            "future",
+            IssuerStatus::Future | IssuerStatus::Active | IssuerStatus::Revoked
+        ) | (
+            "active",
+            IssuerStatus::Active | IssuerStatus::Retired | IssuerStatus::Revoked
+        ) | ("retired", IssuerStatus::Retired | IssuerStatus::Revoked)
+            | ("revoked", IssuerStatus::Revoked)
+    )
+}
+
+async fn admin_register_trust_snapshot(
+    mut req: Request,
+    ctx: RouteContext<()>,
+) -> Result<Response> {
+    let Some(actor) = require_admin(&req, &ctx.env).await? else {
+        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
+    };
+    if req
+        .headers()
+        .get("Content-Length")?
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > MAX_SNAPSHOT_BYTES)
+    {
+        return error("SNAPSHOT_TOO_LARGE", "Trust snapshot is too large", 413);
+    }
+    let bytes = req.bytes().await?;
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return error("SNAPSHOT_TOO_LARGE", "Trust snapshot is too large", 413);
+    }
+    let snapshot_json = match String::from_utf8(bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                "SNAPSHOT_JSON_INVALID",
+                "Trust snapshot must be UTF-8 JSON",
+                400,
+            );
+        }
+    };
+    let snapshot: TrustSnapshot = match serde_json::from_str(&snapshot_json) {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                "SNAPSHOT_JSON_INVALID",
+                "Trust snapshot JSON is invalid",
+                400,
+            );
+        }
+    };
+    let root_public_key = match ctx
+        .env
+        .secret("OFFLINE_ROOT_PUBLIC_KEY")
+        .ok()
+        .and_then(|value| mochios_developer_ca_trust::decode_public_key(&value.to_string()).ok())
+    {
+        Some(value) => value,
+        None => {
+            return error(
+                "ROOT_KEY_UNAVAILABLE",
+                "Offline Root public key is unavailable",
+                503,
+            );
+        }
+    };
+    let expected_root_key_id = mochios_developer_ca_trust::key_id(&root_public_key);
+    if ctx.env.secret("OFFLINE_ROOT_KEY_ID")?.to_string() != expected_root_key_id
+        || snapshot.content.root_key_id != expected_root_key_id
+        || snapshot.verify(&root_public_key, now() as u64).is_err()
+    {
+        return error(
+            "ROOT_SIGNATURE_INVALID",
+            "Trust snapshot Root signature is invalid",
+            422,
+        );
+    }
+    let db = ctx.env.d1("DB")?;
+    if let Some(current) = store::current_trust_snapshot(&db).await? {
+        let current_snapshot: TrustSnapshot = serde_json::from_str(&current.snapshot_json)?;
+        if mochios_developer_ca_trust::validate_trust_successor(&current_snapshot, &snapshot)
+            .is_err()
+        {
+            return error(
+                "TRUST_SNAPSHOT_SUCCESSOR_INVALID",
+                "Trust snapshot rolled back or changed existing issuer authority",
+                409,
+            );
+        }
+    }
+    let existing = store::issuers(&db).await?;
+    for issuer in &existing {
+        let Some(replacement) = snapshot
+            .content
+            .issuers
+            .iter()
+            .find(|candidate| candidate.issuer_key_id == issuer.key_id)
+        else {
+            return error(
+                "ISSUER_OMITTED",
+                "Trust snapshot omitted an existing issuer",
+                409,
+            );
+        };
+        if replacement.public_key != issuer.public_key {
+            return error(
+                "ISSUER_KEY_CHANGED",
+                "Issuer public key cannot be replaced",
+                409,
+            );
+        }
+        if !transition_allowed(&issuer.status, replacement.status) {
+            return error(
+                "ISSUER_TRANSITION_INVALID",
+                "Issuer status transition is invalid",
+                409,
+            );
+        }
+    }
+    if !consume_admin_action(&actor, &ctx.env, "trust_snapshot.register").await? {
+        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
+    }
+    let etag = format!("{:x}", Sha256::digest(snapshot_json.as_bytes()));
+    store::register_trust_snapshot(
+        &db,
+        &snapshot,
+        &snapshot_json,
+        &etag,
+        &actor.account_id,
+        &actor.jti,
+        now(),
+    )
+    .await?;
+    snapshot_response(
+        &req,
+        snapshot_json,
+        &etag,
+        "public, max-age=300, must-revalidate",
+    )
+    .map(|response| response.with_status(201))
+}
+
+fn issuer_view(issuer: IssuerRow) -> Result<serde_json::Value> {
+    Ok(json!({
+        "issuer_key_id": issuer.key_id,
+        "public_key": issuer.public_key,
+        "status": issuer.status,
+        "not_before": issuer.not_before,
+        "not_after": issuer.not_after,
+        "allowed_key_usages": serde_json::from_str::<serde_json::Value>(&issuer.allowed_key_usages_json)?,
+        "trust_snapshot_version": issuer.trust_snapshot_version,
+        "activated_at": issuer.activated_at,
+        "retired_at": issuer.retired_at,
+        "revoked_at": issuer.revoked_at,
+        "revocation_reason": issuer.revocation_reason,
+    }))
+}
+
+async fn admin_list_issuers(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    if require_admin(&req, &ctx.env).await?.is_none() {
+        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
+    }
+    let issuers = store::issuers(&ctx.env.d1("DB")?)
+        .await?
+        .into_iter()
+        .map(issuer_view)
+        .collect::<Result<Vec<_>>>()?;
+    json_response(&json!({"issuers": issuers}), 200)
+}
+
+async fn admin_change_issuer_status(
+    mut req: Request,
+    ctx: RouteContext<()>,
+    desired: IssuerStatus,
+) -> Result<Response> {
+    let Some(actor) = require_admin(&req, &ctx.env).await? else {
+        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
+    };
+    let key_id = param(&ctx, "issuer_key_id");
+    if key_id.len() != 64 || !key_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return error("ISSUER_KEY_ID_INVALID", "Issuer key ID is invalid", 422);
+    }
+    let db = ctx.env.d1("DB")?;
+    let Some(current) = store::current_trust_snapshot(&db).await? else {
+        return error(
+            "TRUST_SNAPSHOT_UNAVAILABLE",
+            "No current trust snapshot",
+            409,
+        );
+    };
+    let snapshot: TrustSnapshot = serde_json::from_str(&current.snapshot_json)?;
+    let signed_status = snapshot
+        .content
+        .issuers
+        .iter()
+        .find(|issuer| issuer.issuer_key_id == key_id)
+        .map(|issuer| issuer.status);
+    if signed_status != Some(desired) {
+        return error(
+            "ISSUER_SNAPSHOT_CONFLICT",
+            "Issuer transition is not authorized by the current Root-signed snapshot",
+            409,
+        );
+    }
+    let reason = if desired == IssuerStatus::Revoked {
+        let input: RevokeInput = req.json().await?;
+        let reason = input.reason.trim().to_owned();
+        if reason.is_empty() || reason.len() > 500 {
+            return error(
+                "REVOCATION_REASON_INVALID",
+                "Revocation reason is invalid",
+                422,
+            );
+        }
+        Some(reason)
+    } else {
+        None
+    };
+    let operation = format!("issuer.{}", desired.as_str());
+    if !consume_admin_action(&actor, &ctx.env, &operation).await? {
+        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
+    }
+    let issuer = store::set_issuer_status(
+        &db,
+        key_id,
+        desired.as_str(),
+        reason.as_deref(),
+        &actor.account_id,
+        now(),
+    )
+    .await?;
+    match issuer {
+        Some(issuer) => json_response(&json!({"issuer": issuer_view(issuer)?}), 200),
+        None => error("ISSUER_NOT_FOUND", "Issuer not found", 404),
+    }
 }
 
 async fn admin_review_queue(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -694,6 +1279,365 @@ async fn admin_creation_review(
     json_response(&json!({"developer_creation_request": value}), 200)
 }
 
+async fn active_certificate_signer(
+    env: &Env,
+    db: &D1Database,
+    issued_at: u64,
+) -> Result<std::result::Result<(ed25519_dalek::SigningKey, IssuerRow), SnapshotBuildError>> {
+    let Some(trust_row) = store::current_trust_snapshot(db).await? else {
+        return Ok(Err(SnapshotBuildError {
+            code: "TRUST_SNAPSHOT_UNAVAILABLE",
+            message: "No current Root-signed trust snapshot is available",
+            status: 503,
+        }));
+    };
+    let Ok(trust): std::result::Result<TrustSnapshot, _> =
+        serde_json::from_str(&trust_row.snapshot_json)
+    else {
+        return Ok(Err(SnapshotBuildError {
+            code: "TRUST_SNAPSHOT_INVALID",
+            message: "The current trust snapshot is invalid",
+            status: 503,
+        }));
+    };
+    let Some(root_public_key) = env
+        .secret("OFFLINE_ROOT_PUBLIC_KEY")
+        .ok()
+        .and_then(|value| mochios_developer_ca_trust::decode_public_key(&value.to_string()).ok())
+    else {
+        return Ok(Err(SnapshotBuildError {
+            code: "ROOT_KEY_UNAVAILABLE",
+            message: "Offline Root public key is unavailable",
+            status: 503,
+        }));
+    };
+    if trust.verify(&root_public_key, issued_at).is_err() {
+        return Ok(Err(SnapshotBuildError {
+            code: "TRUST_SNAPSHOT_INVALID",
+            message: "The current trust snapshot is expired or has an invalid Root signature",
+            status: 503,
+        }));
+    }
+    let Some(private_key) = env.secret("INTERMEDIATE_PRIVATE_KEY").ok() else {
+        return Ok(Err(SnapshotBuildError {
+            code: "ISSUER_KEY_UNAVAILABLE",
+            message: "The online Intermediate key is unavailable",
+            status: 503,
+        }));
+    };
+    let Ok(signing_key) = certificate::signing_key(&private_key.to_string()) else {
+        return Ok(Err(SnapshotBuildError {
+            code: "ISSUER_KEY_INVALID",
+            message: "The online Intermediate key is invalid",
+            status: 503,
+        }));
+    };
+    let key_id = certificate::issuer_key_id(&signing_key.verifying_key());
+    let Some(signed_issuer) = trust
+        .content
+        .issuers
+        .iter()
+        .find(|issuer| issuer.issuer_key_id == key_id)
+    else {
+        return Ok(Err(SnapshotBuildError {
+            code: "ISSUER_NOT_TRUSTED",
+            message: "The online Intermediate is absent from the current trust snapshot",
+            status: 503,
+        }));
+    };
+    if signed_issuer.status != IssuerStatus::Active
+        || !signed_issuer
+            .allowed_key_usages
+            .iter()
+            .any(|usage| usage == "developer-certificate-signing")
+        || issued_at < signed_issuer.not_before
+        || issued_at >= signed_issuer.not_after
+    {
+        return Ok(Err(SnapshotBuildError {
+            code: "ISSUER_NOT_AUTHORIZED",
+            message: "The online Intermediate is not active for certificate issuance",
+            status: 503,
+        }));
+    }
+    let Some(registry_issuer) = store::issuer(db, &key_id).await? else {
+        return Ok(Err(SnapshotBuildError {
+            code: "ISSUER_NOT_REGISTERED",
+            message: "The online Intermediate is absent from the issuer registry",
+            status: 503,
+        }));
+    };
+    if registry_issuer.public_key != signed_issuer.public_key
+        || registry_issuer.status != "active"
+        || registry_issuer.not_before != signed_issuer.not_before as i64
+        || registry_issuer.not_after != signed_issuer.not_after as i64
+        || registry_issuer.trust_snapshot_version != trust_row.snapshot_version
+    {
+        return Ok(Err(SnapshotBuildError {
+            code: "ISSUER_REGISTRY_MISMATCH",
+            message: "The issuer registry does not match the current trust snapshot",
+            status: 503,
+        }));
+    }
+    Ok(Ok((signing_key, registry_issuer)))
+}
+
+struct GeneratedRevocationSnapshot {
+    snapshot: SignedRevocationSnapshot,
+    json: String,
+    etag: String,
+}
+
+struct SnapshotBuildError {
+    code: &'static str,
+    message: &'static str,
+    status: u16,
+}
+
+fn snapshot_build_error(
+    code: &'static str,
+    message: &'static str,
+    status: u16,
+) -> std::result::Result<GeneratedRevocationSnapshot, SnapshotBuildError> {
+    Err(SnapshotBuildError {
+        code,
+        message,
+        status,
+    })
+}
+
+async fn build_revocation_snapshot(
+    env: &Env,
+    db: &D1Database,
+    additional: Option<SnapshotRevocation>,
+    generated_at: u64,
+) -> Result<std::result::Result<GeneratedRevocationSnapshot, SnapshotBuildError>> {
+    let Some(trust_row) = store::current_trust_snapshot(db).await? else {
+        return Ok(snapshot_build_error(
+            "TRUST_SNAPSHOT_UNAVAILABLE",
+            "No current Root-signed trust snapshot is available",
+            503,
+        ));
+    };
+    let Ok(trust): std::result::Result<TrustSnapshot, _> =
+        serde_json::from_str(&trust_row.snapshot_json)
+    else {
+        return Ok(snapshot_build_error(
+            "TRUST_SNAPSHOT_INVALID",
+            "The current trust snapshot is invalid",
+            503,
+        ));
+    };
+    let Some(root_public_key) = env
+        .secret("OFFLINE_ROOT_PUBLIC_KEY")
+        .ok()
+        .and_then(|value| mochios_developer_ca_trust::decode_public_key(&value.to_string()).ok())
+    else {
+        return Ok(snapshot_build_error(
+            "ROOT_KEY_UNAVAILABLE",
+            "Offline Root public key is unavailable",
+            503,
+        ));
+    };
+    if trust.verify(&root_public_key, generated_at).is_err() {
+        return Ok(snapshot_build_error(
+            "TRUST_SNAPSHOT_INVALID",
+            "The current trust snapshot is expired or has an invalid Root signature",
+            503,
+        ));
+    }
+    let Some(private_key) = env.secret("INTERMEDIATE_PRIVATE_KEY").ok() else {
+        return Ok(snapshot_build_error(
+            "ISSUER_KEY_UNAVAILABLE",
+            "The online Intermediate key is unavailable",
+            503,
+        ));
+    };
+    let Ok(signing_key) = certificate::signing_key(&private_key.to_string()) else {
+        return Ok(snapshot_build_error(
+            "ISSUER_KEY_INVALID",
+            "The online Intermediate key is invalid",
+            503,
+        ));
+    };
+    let issuer_key_id = certificate::issuer_key_id(&signing_key.verifying_key());
+    let Some(signed_issuer) = trust
+        .content
+        .issuers
+        .iter()
+        .find(|issuer| issuer.issuer_key_id == issuer_key_id)
+    else {
+        return Ok(snapshot_build_error(
+            "ISSUER_NOT_TRUSTED",
+            "The online Intermediate is absent from the current trust snapshot",
+            503,
+        ));
+    };
+    if !matches!(
+        signed_issuer.status,
+        IssuerStatus::Active | IssuerStatus::Retired
+    ) || !signed_issuer
+        .allowed_key_usages
+        .iter()
+        .any(|usage| usage == "revocation-signing")
+        || generated_at < signed_issuer.not_before
+        || generated_at >= signed_issuer.not_after
+    {
+        return Ok(snapshot_build_error(
+            "ISSUER_NOT_AUTHORIZED",
+            "The online Intermediate is not authorized for revocation signing",
+            503,
+        ));
+    }
+    let Some(registry_issuer) = store::issuer(db, &issuer_key_id).await? else {
+        return Ok(snapshot_build_error(
+            "ISSUER_NOT_REGISTERED",
+            "The online Intermediate is absent from the issuer registry",
+            503,
+        ));
+    };
+    if registry_issuer.public_key != signed_issuer.public_key
+        || registry_issuer.status != signed_issuer.status.as_str()
+        || registry_issuer.trust_snapshot_version != trust_row.snapshot_version
+    {
+        return Ok(snapshot_build_error(
+            "ISSUER_REGISTRY_MISMATCH",
+            "The issuer registry does not match the current trust snapshot",
+            503,
+        ));
+    }
+
+    let current = store::current_revocation_snapshot(db).await?;
+    let version = current
+        .as_ref()
+        .map_or(1, |snapshot| snapshot.snapshot_version.saturating_add(1));
+    let generated_at = current.as_ref().map_or(generated_at, |snapshot| {
+        generated_at.max(snapshot.generated_at as u64)
+    });
+    let mut revocations = Vec::new();
+    for row in store::revocations(db).await? {
+        let Some(reason_code) = RevocationReasonCode::parse(&row.reason_code) else {
+            return Ok(snapshot_build_error(
+                "REVOCATION_DATA_INVALID",
+                "A stored revocation has an invalid public reason code",
+                503,
+            ));
+        };
+        revocations.push(SnapshotRevocation {
+            certificate_serial: row.serial_number,
+            revoked_at: row.revoked_at as u64,
+            reason_code,
+        });
+    }
+    if let Some(additional) = additional {
+        if revocations
+            .iter()
+            .any(|item| item.certificate_serial == additional.certificate_serial)
+        {
+            return Ok(snapshot_build_error(
+                "REVOCATION_CONFLICT",
+                "The certificate already has a revocation record",
+                409,
+            ));
+        }
+        revocations.push(additional);
+    }
+    revocations.sort_by(|left, right| left.certificate_serial.cmp(&right.certificate_serial));
+    let snapshot = match SignedRevocationSnapshot::issue(
+        UnsignedRevocationSnapshot {
+            format_version: REVOCATION_FORMAT_VERSION,
+            snapshot_version: version as u64,
+            generated_at,
+            expires_at: generated_at.saturating_add(60 * 60),
+            issuer_key_id,
+            revocations,
+            signature_algorithm: SIGNATURE_ALGORITHM.into(),
+        },
+        &signing_key,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return Ok(snapshot_build_error(
+                "REVOCATION_SNAPSHOT_INVALID",
+                "The cumulative revocation snapshot could not be generated",
+                503,
+            ));
+        }
+    };
+    if let Some(current) = current {
+        let Ok(previous): std::result::Result<SignedRevocationSnapshot, _> =
+            serde_json::from_str(&current.snapshot_json)
+        else {
+            return Ok(snapshot_build_error(
+                "REVOCATION_SNAPSHOT_INVALID",
+                "The current revocation snapshot is invalid",
+                503,
+            ));
+        };
+        if mochios_developer_ca_trust::validate_revocation_successor(&previous, &snapshot).is_err()
+        {
+            return Ok(snapshot_build_error(
+                "REVOCATION_SNAPSHOT_ROLLBACK",
+                "The cumulative revocation snapshot failed anti-rollback validation",
+                503,
+            ));
+        }
+    }
+    let json = serde_json::to_string(&snapshot)?;
+    if json.len() > MAX_SNAPSHOT_BYTES {
+        return Ok(snapshot_build_error(
+            "REVOCATION_SNAPSHOT_TOO_LARGE",
+            "The revocation snapshot exceeds the service limit",
+            503,
+        ));
+    }
+    let etag = format!("{:x}", Sha256::digest(json.as_bytes()));
+    Ok(Ok(GeneratedRevocationSnapshot {
+        snapshot,
+        json,
+        etag,
+    }))
+}
+
+async fn admin_rebuild_revocation_snapshot(
+    req: Request,
+    ctx: RouteContext<()>,
+) -> Result<Response> {
+    let Some(actor) = require_admin(&req, &ctx.env).await? else {
+        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
+    };
+    let generated_at = now();
+    let db = ctx.env.d1("DB")?;
+    let generated =
+        match build_revocation_snapshot(&ctx.env, &db, None, generated_at as u64).await? {
+            Ok(value) => value,
+            Err(value) => return error(value.code, value.message, value.status),
+        };
+    if !consume_admin_action(&actor, &ctx.env, "revocation_snapshot.rebuild").await? {
+        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
+    }
+    store::save_revocation_snapshot(
+        &db,
+        store::RevocationSnapshotRecord {
+            version: generated.snapshot.content.snapshot_version as i64,
+            generated_at: generated.snapshot.content.generated_at as i64,
+            expires_at: generated.snapshot.content.expires_at as i64,
+            issuer_key_id: &generated.snapshot.content.issuer_key_id,
+            snapshot_json: &generated.json,
+            etag: &generated.etag,
+        },
+        &actor.account_id,
+        generated_at,
+    )
+    .await?;
+    snapshot_response(
+        &req,
+        generated.json,
+        &generated.etag,
+        "public, max-age=60, must-revalidate",
+    )
+    .map(|response| response.with_status(201))
+}
+
 async fn admin_revoke(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Some(actor) = require_admin(&req, &ctx.env).await? else {
         return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
@@ -718,6 +1662,21 @@ async fn admin_revoke(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     let reason_code = input
         .reason_code
         .unwrap_or(RevocationReasonCode::Unspecified);
+    let generated = match build_revocation_snapshot(
+        &ctx.env,
+        &db,
+        Some(SnapshotRevocation {
+            certificate_serial: certificate.serial_number.clone(),
+            revoked_at: revoked_at as u64,
+            reason_code,
+        }),
+        revoked_at as u64,
+    )
+    .await?
+    {
+        Ok(value) => value,
+        Err(value) => return error(value.code, value.message, value.status),
+    };
     if !consume_admin_action(&actor, &ctx.env, "certificate.revoke").await? {
         return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
     }
@@ -727,6 +1686,14 @@ async fn admin_revoke(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
         &actor.account_id,
         input.reason.trim(),
         reason_code.as_str(),
+        store::RevocationSnapshotRecord {
+            version: generated.snapshot.content.snapshot_version as i64,
+            generated_at: generated.snapshot.content.generated_at as i64,
+            expires_at: generated.snapshot.content.expires_at as i64,
+            issuer_key_id: &generated.snapshot.content.issuer_key_id,
+            snapshot_json: &generated.json,
+            etag: &generated.etag,
+        },
         revoked_at,
     )
     .await?
@@ -768,8 +1735,8 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/v1/developer-creation-requests", create_creation_request)
         .get_async("/v1/developer-creation-requests", list_creation_requests)
         .post_async(
-            "/v1/developers/:developer_id/certificates/register",
-            register_certificate,
+            "/v1/developers/:developer_id/certificates/issue",
+            issue_certificate,
         )
         .get_async(
             "/v1/developers/:developer_id/certificates",
@@ -777,12 +1744,29 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         )
         .get_async("/v1/certificates/:certificate_id", get_certificate)
         .get_async("/v1/trust-store", trust_store)
+        .get_async("/v1/trust-store/:snapshot_version", trust_store_version)
         .get_async("/v1/revocations", revocations)
+        .get_async("/v1/revocations/:snapshot_version", revocations_version)
         .get_async(
             "/v1/certificates/:certificate_id/status",
             certificate_status,
         )
         .get_async("/v1/admin/review-queue", admin_review_queue)
+        .post_async("/v1/admin/trust-snapshots", admin_register_trust_snapshot)
+        .get_async("/v1/admin/issuers", admin_list_issuers)
+        .post_async(
+            "/v1/admin/revocation-snapshots/rebuild",
+            admin_rebuild_revocation_snapshot,
+        )
+        .post_async("/v1/admin/issuers/:issuer_key_id/activate", |req, ctx| {
+            admin_change_issuer_status(req, ctx, IssuerStatus::Active)
+        })
+        .post_async("/v1/admin/issuers/:issuer_key_id/retire", |req, ctx| {
+            admin_change_issuer_status(req, ctx, IssuerStatus::Retired)
+        })
+        .post_async("/v1/admin/issuers/:issuer_key_id/revoke", |req, ctx| {
+            admin_change_issuer_status(req, ctx, IssuerStatus::Revoked)
+        })
         .post_async(
             "/v1/admin/developers/:developer_id/verification",
             admin_verification,
@@ -806,6 +1790,17 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
 #[cfg(test)]
 mod tests {
+    use super::etag_matches;
+
+    #[test]
+    fn snapshot_etag_accepts_cloudflare_weak_and_list_validators() {
+        assert!(etag_matches("\"abc\"", "\"abc\""));
+        assert!(etag_matches("W/\"abc\"", "\"abc\""));
+        assert!(etag_matches("\"other\", W/\"abc\"", "\"abc\""));
+        assert!(etag_matches("*", "\"abc\""));
+        assert!(!etag_matches("W/\"other\"", "\"abc\""));
+    }
+
     #[test]
     fn schema_enforces_ownership_and_unique_serials() {
         let schema = include_str!("../migrations/0001_developer_ca.sql");
@@ -815,11 +1810,11 @@ mod tests {
         assert!(schema.contains("audit_logs_no_update"));
 
         let trust_schema = include_str!("../migrations/0002_trust_issuers_policy.sql");
+        assert!(trust_schema.contains("idx_issuers_single_active"));
+        assert!(trust_schema.contains("signed trust snapshots are append-only"));
+        assert!(trust_schema.contains("signed revocation snapshots are append-only"));
+        assert!(trust_schema.contains("issuer public key is immutable"));
         assert!(trust_schema.contains("authentication_replay_cache"));
-        let root_direct = include_str!("../migrations/0004_root_direct_trust.sql");
-        assert!(root_direct.contains("DROP TABLE revocation_snapshots"));
-        assert!(root_direct.contains("DROP TABLE trust_snapshots"));
-        assert!(root_direct.contains("DROP TABLE issuers"));
         let automatic_schema =
             include_str!("../migrations/0003_automatic_certificate_issuance.sql");
         assert!(automatic_schema.contains("Legacy pending request"));
@@ -844,11 +1839,11 @@ mod tests {
     }
 
     #[test]
-    fn certificate_registration_is_self_service_and_admin_can_only_revoke() {
+    fn certificate_issuance_is_self_service_and_admin_can_only_revoke() {
         let source = include_str!("lib.rs");
         let production = source.split("#[cfg(test)]").next().unwrap_or_default();
         let store = include_str!("store.rs");
-        assert!(production.contains("/v1/developers/:developer_id/certificates/register"));
+        assert!(production.contains("/v1/developers/:developer_id/certificates/issue"));
         assert!(production.contains(".get_async(\"/v1/admin/review-queue\", admin_review_queue)"));
         assert!(production.contains("require_admin(&req, &ctx.env)"));
         assert!(production.contains("active_certificates(&db)"));
@@ -856,6 +1851,6 @@ mod tests {
         assert!(!production.contains("/v1/admin/certificate-requests"));
         assert!(!production.contains("admin_developer_policy"));
         assert!(store.contains("member.role IN ('owner', 'admin', 'developer')"));
-        assert!(store.contains("'certificate.registered'"));
+        assert!(store.contains("'certificate.issued'"));
     }
 }

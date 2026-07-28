@@ -1,9 +1,12 @@
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use uuid::{NoContext, Timestamp, Uuid};
 use worker::{D1Database, Result, wasm_bindgen::JsValue};
 
 use crate::certificate::CertificateRequestInput;
-use crate::model::{CertificateRow, CreationRequest, Developer, Member, Revocation};
+use crate::model::{
+    CertificateRow, CreationRequest, Developer, IssuerRow, Member, Revocation,
+    RevocationSnapshotRow, TrustSnapshotRow,
+};
 
 fn value(value: impl AsRef<str>) -> JsValue {
     JsValue::from_str(value.as_ref())
@@ -321,7 +324,7 @@ pub async fn suspend_developer(
     developer(db, developer_id).await
 }
 
-pub struct RegisteredCertificateRecord<'a> {
+pub struct IssuedCertificateRecord<'a> {
     pub request_id: &'a str,
     pub certificate_id: &'a str,
     pub serial: &'a str,
@@ -330,82 +333,301 @@ pub struct RegisteredCertificateRecord<'a> {
     pub not_before: i64,
     pub not_after: i64,
     pub now: i64,
+    pub request_hash: &'a str,
+    pub idempotency_key: &'a str,
+    pub issuance_source: &'a str,
 }
 
-pub async fn register_certificate(
+#[derive(Debug, Deserialize)]
+struct SerialRow {
+    serial: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdempotencyRow {
+    request_hash: String,
+    certificate_id: Option<String>,
+    status: String,
+    updated_at: i64,
+}
+
+pub enum IssueClaim {
+    Claimed,
+    Complete(Box<CertificateRow>),
+    Pending,
+    Conflict,
+}
+
+pub async fn reserve_certificate_serial(db: &D1Database) -> Result<u64> {
+    let row = db
+        .prepare(
+            "UPDATE certificate_serial_sequence SET next_serial=next_serial+1
+             WHERE singleton=1 RETURNING next_serial-1 AS serial",
+        )
+        .first::<SerialRow>(None)
+        .await?
+        .ok_or_else(|| {
+            worker::Error::RustError("certificate serial sequence unavailable".into())
+        })?;
+    u64::try_from(row.serial)
+        .ok()
+        .filter(|serial| *serial > 0)
+        .ok_or_else(|| worker::Error::RustError("certificate serial range exhausted".into()))
+}
+
+pub async fn claim_certificate_issue(
+    db: &D1Database,
+    developer_id: &str,
+    account_id: &str,
+    idempotency_key: &str,
+    request_hash: &str,
+    now: i64,
+) -> Result<IssueClaim> {
+    let inserted = db
+        .prepare(
+            "INSERT OR IGNORE INTO certificate_issue_idempotency
+             (developer_id,account_id,idempotency_key,request_hash,status,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,'pending',?5,?5)",
+        )
+        .bind(&[
+            value(developer_id),
+            value(account_id),
+            value(idempotency_key),
+            value(request_hash),
+            number(now),
+        ])?
+        .run()
+        .await?
+        .meta()?
+        .and_then(|metadata| metadata.changes)
+        .is_some_and(|changes| changes == 1);
+    if inserted {
+        return Ok(IssueClaim::Claimed);
+    }
+    let row = db
+        .prepare(
+            "SELECT request_hash,certificate_id,status,updated_at
+             FROM certificate_issue_idempotency
+             WHERE developer_id=?1 AND account_id=?2 AND idempotency_key=?3",
+        )
+        .bind(&[
+            value(developer_id),
+            value(account_id),
+            value(idempotency_key),
+        ])?
+        .first::<IdempotencyRow>(None)
+        .await?
+        .ok_or_else(|| worker::Error::RustError("idempotency state unavailable".into()))?;
+    if row.request_hash != request_hash {
+        return Ok(IssueClaim::Conflict);
+    }
+    if row.status == "complete"
+        && let Some(certificate_id) = row.certificate_id
+        && let Some(certificate) = certificate(db, &certificate_id).await?
+    {
+        return Ok(IssueClaim::Complete(Box::new(certificate)));
+    }
+    if row.updated_at > now.saturating_sub(300) {
+        return Ok(IssueClaim::Pending);
+    }
+    let reclaimed = db
+        .prepare(
+            "UPDATE certificate_issue_idempotency SET updated_at=?1
+             WHERE developer_id=?2 AND account_id=?3 AND idempotency_key=?4
+               AND status='pending' AND updated_at<=?5",
+        )
+        .bind(&[
+            number(now),
+            value(developer_id),
+            value(account_id),
+            value(idempotency_key),
+            number(now.saturating_sub(300)),
+        ])?
+        .run()
+        .await?
+        .meta()?
+        .and_then(|metadata| metadata.changes)
+        .is_some_and(|changes| changes == 1);
+    Ok(if reclaimed {
+        IssueClaim::Claimed
+    } else {
+        IssueClaim::Pending
+    })
+}
+
+pub async fn abandon_certificate_issue(
+    db: &D1Database,
+    developer_id: &str,
+    account_id: &str,
+    idempotency_key: &str,
+    request_hash: &str,
+) -> Result<()> {
+    db.prepare(
+        "DELETE FROM certificate_issue_idempotency
+         WHERE developer_id=?1 AND account_id=?2 AND idempotency_key=?3
+           AND request_hash=?4 AND status='pending'",
+    )
+    .bind(&[
+        value(developer_id),
+        value(account_id),
+        value(idempotency_key),
+        value(request_hash),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+pub async fn record_certificate_issue_attempt(
+    db: &D1Database,
+    account_id: &str,
+    developer_id: &str,
+    subject_key_id: &str,
+    request_hash: &str,
+    now: i64,
+) -> Result<bool> {
+    db.prepare("DELETE FROM certificate_issuance_attempts WHERE created_at<=?1")
+        .bind(&[number(now.saturating_sub(86_400))])?
+        .run()
+        .await?;
+    let result = db
+        .prepare(
+            "INSERT INTO certificate_issuance_attempts
+             (id,account_id,developer_id,subject_key_id,request_hash,created_at)
+             SELECT ?1,?2,?3,?4,?5,?6
+             WHERE (SELECT COUNT(*) FROM certificate_issuance_attempts
+                    WHERE account_id=?2 AND created_at>?7) < 20
+               AND (SELECT COUNT(*) FROM certificate_issuance_attempts
+                    WHERE developer_id=?3 AND created_at>?7) < 20
+               AND (SELECT COUNT(*) FROM certificate_issuance_attempts
+                    WHERE subject_key_id=?4 AND created_at>?7) < 10",
+        )
+        .bind(&[
+            value(id(now)),
+            value(account_id),
+            value(developer_id),
+            value(subject_key_id),
+            value(request_hash),
+            number(now),
+            number(now.saturating_sub(3_600)),
+        ])?
+        .run()
+        .await?;
+    Ok(result
+        .meta()?
+        .and_then(|metadata| metadata.changes)
+        .is_some_and(|changes| changes == 1))
+}
+
+pub async fn issue_certificate(
     db: &D1Database,
     developer_id: &str,
     account_id: &str,
     input: &CertificateRequestInput,
-    registered: RegisteredCertificateRecord<'_>,
+    issued: IssuedCertificateRecord<'_>,
 ) -> Result<Option<CertificateRow>> {
     let subject_key_id = input.subject_key_id().map_err(worker::Error::RustError)?;
+    let audit_metadata = serde_json::to_string(&serde_json::json!({
+        "certificate_id": issued.certificate_id,
+        "serial_number": issued.serial,
+        "issuer_key_id": issued.issuer,
+        "subject_key_id": subject_key_id,
+        "package_id_scopes": input.package_id_scopes,
+        "allowed_capabilities": input.allowed_capabilities,
+        "issuance_source": issued.issuance_source,
+        "idempotency_key": issued.idempotency_key,
+    }))?;
     db.batch(vec![
         db.prepare(
             "INSERT INTO certificate_requests
              (id, developer_id, requested_by_account_id, signature_algorithm, subject_public_key,
               subject_key_id, package_id_scopes_json, allowed_capabilities_json, status,
-              processed_by_account_id, processed_at, created_at, updated_at)
-             SELECT ?1, developer.id, ?2, ?3, ?4, ?5, ?6, ?7, 'issued', ?2, ?8, ?8, ?8
+              processed_by_account_id, processed_at, created_at, updated_at,
+              request_hash,idempotency_key,issuance_path)
+             SELECT ?1, developer.id, ?2, ?3, ?4, ?5, ?6, ?7, 'issued', ?2, ?8, ?8, ?8,
+                    ?9,?10,'console_public_key'
              FROM developers developer
              JOIN developer_members member ON member.developer_id=developer.id
-             WHERE developer.id=?9 AND developer.status='active'
+             WHERE developer.id=?11 AND developer.status='active'
                AND developer.verification_status='verified' AND member.account_id=?2
                AND member.status='active' AND member.role IN ('owner', 'admin', 'developer')",
         ).bind(&[
-            value(registered.request_id), value(account_id), value(&input.signature_algorithm),
+            value(issued.request_id), value(account_id), value(&input.signature_algorithm),
             value(&input.subject_public_key), value(&subject_key_id),
             value(serde_json::to_string(&input.package_id_scopes)?),
-            value(serde_json::to_string(&input.allowed_capabilities)?), number(registered.now),
-            value(developer_id),
+            value(serde_json::to_string(&input.allowed_capabilities)?), number(issued.now),
+            value(issued.request_hash), value(issued.idempotency_key), value(developer_id),
         ])?,
         db.prepare(
             "INSERT INTO certificates
              (id, certificate_request_id, developer_id, serial_number, issuer_key_id, subject_key_id,
-              certificate_json, not_before, not_after, status, created_at)
+              certificate_json, not_before, not_after, status, created_at,
+              issuance_source,issued_by_account_id)
              SELECT ?1, request.id, request.developer_id, ?2, ?3, request.subject_key_id,
-                    ?4, ?5, ?6, 'active', ?7
+                    ?4, ?5, ?6, 'active', ?7, ?10, ?9
              FROM certificate_requests request
              WHERE request.id=?8 AND request.status='issued'
                AND request.requested_by_account_id=?9",
         ).bind(&[
-            value(registered.certificate_id), value(registered.serial), value(registered.issuer),
-            value(registered.certificate_json), number(registered.not_before), number(registered.not_after),
-            number(registered.now), value(registered.request_id), value(account_id),
+            value(issued.certificate_id), value(issued.serial), value(issued.issuer),
+            value(issued.certificate_json), number(issued.not_before), number(issued.not_after),
+            number(issued.now), value(issued.request_id), value(account_id), value(issued.issuance_source),
+        ])?,
+        db.prepare(
+            "UPDATE certificate_issue_idempotency
+             SET certificate_id=?1,status='complete',updated_at=?2
+             WHERE developer_id=?3 AND account_id=?4 AND idempotency_key=?5
+               AND request_hash=?6 AND status='pending'
+               AND EXISTS (SELECT 1 FROM certificates WHERE id=?1)",
+        ).bind(&[
+            value(issued.certificate_id), number(issued.now), value(developer_id), value(account_id),
+            value(issued.idempotency_key), value(issued.request_hash),
         ])?,
         db.prepare(
             "INSERT INTO audit_logs (id, developer_id, actor_account_id, event_type, metadata_json, created_at)
-             SELECT ?1, ?2, ?3, 'certificate.registered', '{}', ?4
-             FROM certificates WHERE id=?5",
+             SELECT ?1, ?2, ?3, 'certificate.issued', ?4, ?5
+             FROM certificates WHERE id=?6",
         ).bind(&[
-            value(id(registered.now)), value(developer_id), value(account_id), number(registered.now),
-            value(registered.certificate_id),
+            value(id(issued.now)), value(developer_id), value(account_id), value(audit_metadata),
+            number(issued.now), value(issued.certificate_id),
         ])?,
     ]).await?;
-    certificate(db, registered.certificate_id).await
+    certificate(db, issued.certificate_id).await
 }
 
 pub async fn certificate(db: &D1Database, certificate_id: &str) -> Result<Option<CertificateRow>> {
     db.prepare(
         "SELECT id, certificate_request_id, developer_id, serial_number, issuer_key_id, subject_key_id,
-         certificate_json, not_before, not_after, status, created_at FROM certificates WHERE id=?1",
+         certificate_json, not_before, not_after, status, created_at, issuance_source,
+         issued_by_account_id FROM certificates WHERE id=?1",
     ).bind(&[value(certificate_id)])?.first(None).await
 }
 
 pub async fn list_certificates(db: &D1Database, developer_id: &str) -> Result<Vec<CertificateRow>> {
     all(db.prepare(
         "SELECT id, certificate_request_id, developer_id, serial_number, issuer_key_id, subject_key_id,
-         certificate_json, not_before, not_after, status, created_at FROM certificates WHERE developer_id=?1 ORDER BY created_at DESC",
+         certificate_json, not_before, not_after, status, created_at, issuance_source,
+         issued_by_account_id FROM certificates WHERE developer_id=?1 ORDER BY created_at DESC",
     ).bind(&[value(developer_id)])?).await
 }
 
 pub async fn active_certificates(db: &D1Database) -> Result<Vec<CertificateRow>> {
     all(db.prepare(
         "SELECT id, certificate_request_id, developer_id, serial_number, issuer_key_id, subject_key_id,
-         certificate_json, not_before, not_after, status, created_at FROM certificates
+         certificate_json, not_before, not_after, status, created_at, issuance_source,
+         issued_by_account_id FROM certificates
          WHERE status='active' ORDER BY created_at DESC LIMIT 100",
     ))
     .await
+}
+
+pub struct RevocationSnapshotRecord<'a> {
+    pub version: i64,
+    pub generated_at: i64,
+    pub expires_at: i64,
+    pub issuer_key_id: &'a str,
+    pub snapshot_json: &'a str,
+    pub etag: &'a str,
 }
 
 pub async fn revoke_certificate(
@@ -414,6 +636,7 @@ pub async fn revoke_certificate(
     actor: &str,
     reason: &str,
     reason_code: &str,
+    snapshot: RevocationSnapshotRecord<'_>,
     now: i64,
 ) -> Result<Option<CertificateRow>> {
     let Some(cert) = certificate(db, certificate_id).await? else {
@@ -431,6 +654,16 @@ pub async fn revoke_certificate(
         ).bind(&[
             value(id(now)), value(certificate_id), value(&cert.serial_number), value(reason),
             value(reason_code), value(actor), number(now)
+        ])?,
+        db.prepare("UPDATE revocation_snapshots SET is_current=0 WHERE is_current=1"),
+        db.prepare(
+            "INSERT INTO revocation_snapshots
+             (snapshot_version, generated_at, expires_at, issuer_key_id, snapshot_json, etag,
+              is_current, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+        ).bind(&[
+            number(snapshot.version), number(snapshot.generated_at), number(snapshot.expires_at),
+            value(snapshot.issuer_key_id), value(snapshot.snapshot_json), value(snapshot.etag), number(now)
         ])?,
         audit(db, Some(&cert.developer_id), Some(actor), "certificate.revoked", now)?,
     ]).await?;
@@ -454,6 +687,204 @@ pub async fn revocation_for_certificate(
          revoked_at FROM revocations WHERE certificate_id=?1",
     )
     .bind(&[value(certificate_id)])?
+    .first(None)
+    .await
+}
+
+pub async fn save_revocation_snapshot(
+    db: &D1Database,
+    snapshot: RevocationSnapshotRecord<'_>,
+    actor: &str,
+    now: i64,
+) -> Result<()> {
+    db.batch(vec![
+        db.prepare("UPDATE revocation_snapshots SET is_current=0 WHERE is_current=1"),
+        db.prepare(
+            "INSERT INTO revocation_snapshots
+             (snapshot_version, generated_at, expires_at, issuer_key_id, snapshot_json, etag,
+              is_current, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+        )
+        .bind(&[
+            number(snapshot.version),
+            number(snapshot.generated_at),
+            number(snapshot.expires_at),
+            value(snapshot.issuer_key_id),
+            value(snapshot.snapshot_json),
+            value(snapshot.etag),
+            number(now),
+        ])?,
+        audit(db, None, Some(actor), "revocation_snapshot.generated", now)?,
+    ])
+    .await?;
+    Ok(())
+}
+
+pub async fn issuers(db: &D1Database) -> Result<Vec<IssuerRow>> {
+    all(db.prepare(
+        "SELECT key_id, public_key, status, not_before, not_after, allowed_key_usages_json,
+         trust_snapshot_version, root_signed_record, created_at, activated_at, retired_at,
+         revoked_at, revocation_reason FROM issuers ORDER BY key_id",
+    ))
+    .await
+}
+
+pub async fn issuer(db: &D1Database, key_id: &str) -> Result<Option<IssuerRow>> {
+    db.prepare(
+        "SELECT key_id, public_key, status, not_before, not_after, allowed_key_usages_json,
+         trust_snapshot_version, root_signed_record, created_at, activated_at, retired_at,
+         revoked_at, revocation_reason FROM issuers WHERE key_id=?1",
+    )
+    .bind(&[value(key_id)])?
+    .first(None)
+    .await
+}
+
+pub async fn current_trust_snapshot(db: &D1Database) -> Result<Option<TrustSnapshotRow>> {
+    db.prepare(
+        "SELECT snapshot_version, generated_at, expires_at, root_key_id, snapshot_json, etag,
+         is_current, registered_by_account_id, registered_at, admin_token_jti
+         FROM trust_snapshots WHERE is_current=1 LIMIT 1",
+    )
+    .first(None)
+    .await
+}
+
+pub async fn trust_snapshot(
+    db: &D1Database,
+    snapshot_version: i64,
+) -> Result<Option<TrustSnapshotRow>> {
+    db.prepare(
+        "SELECT snapshot_version, generated_at, expires_at, root_key_id, snapshot_json, etag,
+         is_current, registered_by_account_id, registered_at, admin_token_jti
+         FROM trust_snapshots WHERE snapshot_version=?1",
+    )
+    .bind(&[number(snapshot_version)])?
+    .first(None)
+    .await
+}
+
+pub async fn register_trust_snapshot(
+    db: &D1Database,
+    snapshot: &mochios_developer_ca_trust::TrustSnapshot,
+    snapshot_json: &str,
+    etag: &str,
+    actor: &str,
+    jti: &str,
+    now: i64,
+) -> Result<()> {
+    let mut statements = vec![
+        db.prepare("UPDATE trust_snapshots SET is_current=0 WHERE is_current=1"),
+        db.prepare(
+            "INSERT INTO trust_snapshots
+             (snapshot_version, generated_at, expires_at, root_key_id, snapshot_json, etag,
+              is_current, registered_by_account_id, registered_at, admin_token_jti)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9)",
+        )
+        .bind(&[
+            number(snapshot.content.snapshot_version as i64),
+            number(snapshot.content.generated_at as i64),
+            number(snapshot.content.expires_at as i64),
+            value(&snapshot.content.root_key_id),
+            value(snapshot_json),
+            value(etag),
+            value(actor),
+            number(now),
+            value(jti),
+        ])?,
+    ];
+    for issuer in &snapshot.content.issuers {
+        let status = issuer.status.as_str();
+        statements.push(
+            db.prepare(
+                "INSERT INTO issuers
+                 (key_id, public_key, status, not_before, not_after, allowed_key_usages_json,
+                  trust_snapshot_version, root_signed_record, created_at, activated_at, retired_at,
+                  revoked_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                  CASE WHEN ?3='active' THEN ?9 ELSE NULL END,
+                  CASE WHEN ?3='retired' THEN ?9 ELSE NULL END,
+                  CASE WHEN ?3='revoked' THEN ?9 ELSE NULL END)
+                 ON CONFLICT(key_id) DO UPDATE SET
+                  status=excluded.status, not_before=excluded.not_before, not_after=excluded.not_after,
+                  allowed_key_usages_json=excluded.allowed_key_usages_json,
+                  trust_snapshot_version=excluded.trust_snapshot_version,
+                  root_signed_record=excluded.root_signed_record,
+                  activated_at=COALESCE(issuers.activated_at, excluded.activated_at),
+                  retired_at=COALESCE(issuers.retired_at, excluded.retired_at),
+                  revoked_at=COALESCE(issuers.revoked_at, excluded.revoked_at)
+                 WHERE issuers.public_key=excluded.public_key
+                   AND issuers.trust_snapshot_version < excluded.trust_snapshot_version",
+            )
+            .bind(&[
+                value(&issuer.issuer_key_id),
+                value(&issuer.public_key),
+                value(status),
+                number(issuer.not_before as i64),
+                number(issuer.not_after as i64),
+                value(serde_json::to_string(&issuer.allowed_key_usages)?),
+                number(snapshot.content.snapshot_version as i64),
+                value(snapshot_json),
+                number(now),
+            ])?,
+        );
+    }
+    statements.push(audit(
+        db,
+        None,
+        Some(actor),
+        "trust_snapshot.registered",
+        now,
+    )?);
+    db.batch(statements).await?;
+    Ok(())
+}
+
+pub async fn set_issuer_status(
+    db: &D1Database,
+    key_id: &str,
+    status: &str,
+    reason: Option<&str>,
+    actor: &str,
+    now: i64,
+) -> Result<Option<IssuerRow>> {
+    let timestamp_column = match status {
+        "active" => "activated_at",
+        "retired" => "retired_at",
+        "revoked" => "revoked_at",
+        _ => return Ok(None),
+    };
+    let query = format!(
+        "UPDATE issuers SET status=?1, {timestamp_column}=?2,
+         revocation_reason=CASE WHEN ?1='revoked' THEN ?3 ELSE revocation_reason END WHERE key_id=?4"
+    );
+    db.batch(vec![
+        db.prepare(&query)
+            .bind(&[value(status), number(now), nullable(reason), value(key_id)])?,
+        audit(db, None, Some(actor), &format!("issuer.{status}"), now)?,
+    ])
+    .await?;
+    issuer(db, key_id).await
+}
+
+pub async fn current_revocation_snapshot(db: &D1Database) -> Result<Option<RevocationSnapshotRow>> {
+    db.prepare(
+        "SELECT snapshot_version, generated_at, expires_at, issuer_key_id, snapshot_json, etag,
+         is_current, created_at FROM revocation_snapshots WHERE is_current=1 LIMIT 1",
+    )
+    .first(None)
+    .await
+}
+
+pub async fn revocation_snapshot(
+    db: &D1Database,
+    snapshot_version: i64,
+) -> Result<Option<RevocationSnapshotRow>> {
+    db.prepare(
+        "SELECT snapshot_version, generated_at, expires_at, issuer_key_id, snapshot_json, etag,
+         is_current, created_at FROM revocation_snapshots WHERE snapshot_version=?1",
+    )
+    .bind(&[number(snapshot_version)])?
     .first(None)
     .await
 }

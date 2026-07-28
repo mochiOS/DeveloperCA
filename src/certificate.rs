@@ -1,5 +1,5 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use mochios_certificate::{
     DeveloperCertificate, KEY_USAGE_PACKAGE_SIGNING, PackageIdScope, PackageScopeKind,
     SIGNATURE_LEN, is_valid_capability, key_id,
@@ -8,12 +8,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const SIGNATURE_ALGORITHM: &str = "ed25519";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CertificateRegistrationInput {
-    pub certificate: String,
-}
 
 pub fn validate_package_scope(value: &str) -> Result<(), String> {
     parse_scopes(&[value.to_owned()]).map(|_| ())
@@ -27,11 +21,32 @@ pub fn validate_capability(value: &str) -> Result<(), String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CertificateIssueInput {
+    pub subject_public_key: String,
+    pub package_id: String,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct CertificateRequestInput {
     pub signature_algorithm: String,
     pub subject_public_key: String,
     pub package_id_scopes: Vec<String>,
     pub allowed_capabilities: Vec<String>,
+}
+
+impl CertificateIssueInput {
+    pub fn into_request(mut self) -> Result<CertificateRequestInput, String> {
+        self.capabilities.sort();
+        let request = CertificateRequestInput {
+            signature_algorithm: SIGNATURE_ALGORITHM.into(),
+            subject_public_key: encoded_public_key(&decode_public_key(&self.subject_public_key)?),
+            package_id_scopes: vec![self.package_id],
+            allowed_capabilities: self.capabilities,
+        };
+        request.validate()?;
+        Ok(request)
+    }
 }
 
 impl CertificateRequestInput {
@@ -78,6 +93,50 @@ impl CertificateRequestInput {
     }
 }
 
+pub struct IssueCertificate<'a> {
+    pub serial_number: u64,
+    pub developer_id: &'a str,
+    pub not_before: u64,
+    pub not_after: u64,
+    pub request: &'a CertificateRequestInput,
+}
+
+pub fn issue(input: IssueCertificate<'_>, signing_key: &SigningKey) -> Result<Vec<u8>, String> {
+    let issuer_public_key = signing_key.verifying_key().to_bytes();
+    let subject_public_key = input.request.subject_public_key_bytes()?;
+    let mut certificate = DeveloperCertificate {
+        serial_number: input.serial_number,
+        issuer_key_id: key_id(&issuer_public_key),
+        developer_id: input.developer_id.into(),
+        subject_key_id: key_id(&subject_public_key),
+        subject_public_key,
+        not_before: input.not_before,
+        not_after: input.not_after,
+        key_usage: KEY_USAGE_PACKAGE_SIGNING,
+        package_id_scopes: input.request.canonical_scopes()?,
+        allowed_capabilities: input.request.canonical_capabilities()?,
+        signature: [0; SIGNATURE_LEN],
+    };
+    certificate.validate().map_err(|error| error.to_string())?;
+    certificate.signature = signing_key
+        .sign(
+            &certificate
+                .signing_message()
+                .map_err(|error| error.to_string())?,
+        )
+        .to_bytes();
+    let mut wire = vec![
+        0;
+        certificate
+            .encoded_len()
+            .map_err(|error| error.to_string())?
+    ];
+    certificate
+        .encode(&mut wire)
+        .map_err(|error| error.to_string())?;
+    Ok(wire)
+}
+
 pub fn decode(wire: &[u8]) -> Result<DeveloperCertificate, String> {
     DeveloperCertificate::decode(wire).map_err(|error| error.to_string())
 }
@@ -109,51 +168,6 @@ pub fn verify(
         .map_err(|error| error.to_string())
 }
 
-pub fn request_from_certificate(certificate: &DeveloperCertificate) -> CertificateRequestInput {
-    CertificateRequestInput {
-        signature_algorithm: SIGNATURE_ALGORITHM.into(),
-        subject_public_key: STANDARD.encode(certificate.subject_public_key),
-        package_id_scopes: certificate
-            .package_id_scopes
-            .iter()
-            .map(scope_string)
-            .collect(),
-        allowed_capabilities: certificate.allowed_capabilities.clone(),
-    }
-}
-
-pub fn root_public_key(encoded: &str) -> Result<[u8; 32], String> {
-    let value = encoded.trim();
-    let bytes = if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        (0..32)
-            .map(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| "invalid Root public key hex")?
-    } else {
-        STANDARD
-            .decode(value)
-            .map_err(|_| "invalid Root public key encoding")?
-    };
-    bytes
-        .try_into()
-        .map_err(|_| "Root public key must be 32 bytes".into())
-}
-
-pub fn root_public_keys(encoded: &str) -> Result<Vec<[u8; 32]>, String> {
-    let mut keys = encoded
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(root_public_key)
-        .collect::<Result<Vec<_>, _>>()?;
-    keys.sort();
-    keys.dedup();
-    if keys.is_empty() {
-        return Err("at least one Root public key is required".into());
-    }
-    Ok(keys)
-}
-
 pub fn view(certificate: &DeveloperCertificate) -> Value {
     json!({
         "content": {
@@ -175,6 +189,16 @@ pub fn view(certificate: &DeveloperCertificate) -> Value {
     })
 }
 
+pub fn signing_key(encoded: &str) -> Result<SigningKey, String> {
+    let bytes = STANDARD
+        .decode(encoded)
+        .map_err(|_| "invalid intermediate private key encoding")?;
+    let seed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "intermediate private key must be 32 bytes")?;
+    Ok(SigningKey::from_bytes(&seed))
+}
+
 pub fn encoded_public_key(key: &VerifyingKey) -> String {
     STANDARD.encode(key.as_bytes())
 }
@@ -183,10 +207,18 @@ pub fn issuer_key_id(key: &VerifyingKey) -> String {
     hex(&key_id(key.as_bytes()))
 }
 
-fn decode_public_key(encoded: &str) -> Result<VerifyingKey, String> {
-    let bytes = STANDARD
-        .decode(encoded)
-        .map_err(|_| "invalid public key encoding")?;
+pub fn decode_public_key(encoded: &str) -> Result<VerifyingKey, String> {
+    let value = encoded.trim();
+    let bytes = if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        (0..32)
+            .map(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "invalid public key hex")?
+    } else {
+        STANDARD
+            .decode(value)
+            .map_err(|_| "invalid public key encoding")?
+    };
     let key: [u8; 32] = bytes
         .try_into()
         .map_err(|_| "Ed25519 public key must be 32 bytes")?;
@@ -246,7 +278,6 @@ pub fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
 
     fn request() -> CertificateRequestInput {
         let signing = SigningKey::from_bytes(&[7; 32]);
@@ -259,17 +290,22 @@ mod tests {
     }
 
     #[test]
-    fn accepts_hex_and_base64_root_public_keys() {
-        let key = SigningKey::from_bytes(&[3; 32]).verifying_key().to_bytes();
-        let other = SigningKey::from_bytes(&[4; 32]).verifying_key().to_bytes();
-        assert_eq!(root_public_key(&hex(&key)).unwrap(), key);
-        assert_eq!(root_public_key(&STANDARD.encode(key)).unwrap(), key);
-        assert_eq!(
-            root_public_keys(&format!("{},{}", hex(&key), hex(&other)))
-                .unwrap()
-                .len(),
-            2
-        );
+    fn shared_wire_round_trips_and_verifies() {
+        let issuer = SigningKey::from_bytes(&[3; 32]);
+        let wire = issue(
+            IssueCertificate {
+                serial_number: 7,
+                developer_id: "018f0000-0000-7000-8000-000000000001",
+                not_before: 100,
+                not_after: 200,
+                request: &request(),
+            },
+            &issuer,
+        )
+        .unwrap();
+        let certificate = decode(&wire).unwrap();
+        verify(&certificate, &issuer.verifying_key().to_bytes(), 150).unwrap();
+        assert_eq!(certificate.allowed_capabilities, ["network.client"]);
     }
 
     #[test]
@@ -280,5 +316,52 @@ mod tests {
         let mut input = request();
         input.package_id_scopes = vec!["dev.mochi.*".into(), "dev.mochi.*".into()];
         assert!(input.validate().is_err());
+    }
+
+    #[test]
+    fn public_issue_input_is_exact_scoped_and_canonical() {
+        let signing = SigningKey::from_bytes(&[9; 32]);
+        let input = CertificateIssueInput {
+            subject_public_key: hex(signing.verifying_key().as_bytes()),
+            package_id: "org.mochios.example".into(),
+            capabilities: vec!["window.create".into(), "fs.read.all".into()],
+        };
+        let request = input.into_request().unwrap();
+        assert_eq!(
+            request.subject_public_key,
+            encoded_public_key(&signing.verifying_key())
+        );
+        assert_eq!(request.package_id_scopes, ["org.mochios.example"]);
+        assert_eq!(
+            request.allowed_capabilities,
+            ["fs.read.all", "window.create"]
+        );
+        assert_eq!(
+            request.canonical_scopes().unwrap()[0].kind,
+            PackageScopeKind::Exact
+        );
+    }
+
+    #[test]
+    fn issue_input_rejects_private_material_and_unknown_fields() {
+        let private_material = STANDARD.encode([7_u8; 64]);
+        assert!(
+            CertificateIssueInput {
+                subject_public_key: private_material,
+                package_id: "org.mochios.example".into(),
+                capabilities: vec![],
+            }
+            .into_request()
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CertificateIssueInput>(json!({
+                "subject_public_key": STANDARD.encode([1_u8; 32]),
+                "package_id": "org.mochios.example",
+                "capabilities": [],
+                "private_key": "must-not-be-accepted"
+            }))
+            .is_err()
+        );
     }
 }

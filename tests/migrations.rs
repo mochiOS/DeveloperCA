@@ -7,6 +7,7 @@ const AUTOMATIC_ISSUANCE: &str =
 const ROOT_DIRECT: &str = include_str!("../migrations/0004_root_direct_trust.sql");
 const CERTIFICATE_DEVELOPER_ID: &str =
     include_str!("../migrations/0005_certificate_developer_id.sql");
+const ONLINE_ISSUANCE: &str = include_str!("../migrations/0006_online_certificate_issuance.sql");
 
 fn existing_database() -> Connection {
     let connection = Connection::open_in_memory().expect("open fixture database");
@@ -219,7 +220,7 @@ fn failed_migration_transaction_can_be_rolled_back_and_retried() {
 }
 
 #[test]
-fn root_direct_migration_removes_intermediate_state_and_preserves_certificates() {
+fn online_issuance_migration_preserves_trust_and_existing_records() {
     let connection = existing_database();
     connection
         .execute_batch(TRUST)
@@ -233,6 +234,9 @@ fn root_direct_migration_removes_intermediate_state_and_preserves_certificates()
     connection
         .execute_batch(CERTIFICATE_DEVELOPER_ID)
         .expect("add certificate Developer ID");
+    connection
+        .execute_batch(ONLINE_ISSUANCE)
+        .expect("apply online issuance migration");
 
     for table in ["issuers", "trust_snapshots", "revocation_snapshots"] {
         assert_eq!(
@@ -243,8 +247,8 @@ fn root_direct_migration_removes_intermediate_state_and_preserves_certificates()
                     |row| row.get::<_, i64>(0),
                 )
                 .expect("table lookup"),
-            0,
-            "obsolete table remains: {table}"
+            1,
+            "trust table is missing: {table}"
         );
     }
     assert_eq!(
@@ -271,4 +275,40 @@ fn root_direct_migration_removes_intermediate_state_and_preserves_certificates()
             .expect("certificate Developer ID"),
         "org.mochios.developer.developer1"
     );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT issuance_source FROM certificates WHERE id='certificate-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("legacy certificate issuance source"),
+        "legacy_root"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT next_serial FROM certificate_serial_sequence WHERE singleton=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("next certificate serial"),
+        43
+    );
+    for table in [
+        "certificate_issue_idempotency",
+        "certificate_issuance_attempts",
+    ] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("table lookup"),
+            1,
+            "issuance table is missing: {table}"
+        );
+    }
 }
