@@ -312,3 +312,79 @@ fn online_issuance_migration_preserves_trust_and_existing_records() {
         );
     }
 }
+
+#[test]
+fn online_issuance_schema_prevents_serial_and_idempotency_reuse() {
+    let connection = existing_database();
+    connection
+        .execute_batch(TRUST)
+        .expect("apply trust migration");
+    connection
+        .execute_batch(AUTOMATIC_ISSUANCE)
+        .expect("apply automatic issuance migration");
+    connection
+        .execute_batch(ROOT_DIRECT)
+        .expect("apply Root-direct migration");
+    connection
+        .execute_batch(CERTIFICATE_DEVELOPER_ID)
+        .expect("add certificate Developer ID");
+    connection
+        .execute_batch(ONLINE_ISSUANCE)
+        .expect("apply online issuance migration");
+
+    connection
+        .execute(
+            "INSERT INTO certificate_issue_idempotency
+             (developer_id,account_id,idempotency_key,request_hash,status,created_at,updated_at)
+             VALUES ('developer-1','account-1','idempotency-key-1','hash-1','pending',10,10)",
+            [],
+        )
+        .expect("insert idempotency claim");
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO certificate_issue_idempotency
+                 (developer_id,account_id,idempotency_key,request_hash,status,created_at,updated_at)
+                 VALUES ('developer-1','account-1','idempotency-key-1','hash-1','pending',11,11)",
+                [],
+            )
+            .is_err(),
+        "the same idempotency key was accepted twice"
+    );
+
+    let serial: i64 = connection
+        .query_row(
+            "UPDATE certificate_serial_sequence
+             SET next_serial=next_serial+1 WHERE singleton=1
+             RETURNING next_serial-1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("reserve serial");
+    assert_eq!(serial, 43);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT next_serial FROM certificate_serial_sequence WHERE singleton=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("next serial"),
+        44
+    );
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO certificates
+                 (id,certificate_request_id,developer_id,serial_number,issuer_key_id,
+                  subject_key_id,certificate_json,not_before,not_after,status,created_at,
+                  issuance_source,issued_by_account_id)
+                 SELECT 'duplicate-serial',id,developer_id,'42','issuer-2',subject_key_id,
+                        'wire-2',2,101,'active',2,'online_intermediate','account-1'
+                 FROM certificate_requests WHERE id='request-1'",
+                [],
+            )
+            .is_err(),
+        "an existing serial was reused"
+    );
+}
