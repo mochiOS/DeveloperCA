@@ -4,6 +4,9 @@ const INITIAL: &str = include_str!("../migrations/0001_developer_ca.sql");
 const TRUST: &str = include_str!("../migrations/0002_trust_issuers_policy.sql");
 const AUTOMATIC_ISSUANCE: &str =
     include_str!("../migrations/0003_automatic_certificate_issuance.sql");
+const ROOT_DIRECT: &str = include_str!("../migrations/0004_root_direct_trust.sql");
+const CERTIFICATE_DEVELOPER_ID: &str =
+    include_str!("../migrations/0005_certificate_developer_id.sql");
 
 fn existing_database() -> Connection {
     let connection = Connection::open_in_memory().expect("open fixture database");
@@ -212,5 +215,60 @@ fn failed_migration_transaction_can_be_rolled_back_and_retried() {
                 .get::<_, i64>(0))
             .expect("certificate count"),
         1
+    );
+}
+
+#[test]
+fn root_direct_migration_removes_intermediate_state_and_preserves_certificates() {
+    let connection = existing_database();
+    connection
+        .execute_batch(TRUST)
+        .expect("apply trust migration");
+    connection
+        .execute_batch(AUTOMATIC_ISSUANCE)
+        .expect("apply automatic issuance migration");
+    connection
+        .execute_batch(ROOT_DIRECT)
+        .expect("apply Root-direct migration");
+    connection
+        .execute_batch(CERTIFICATE_DEVELOPER_ID)
+        .expect("add certificate Developer ID");
+
+    for table in ["issuers", "trust_snapshots", "revocation_snapshots"] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("table lookup"),
+            0,
+            "obsolete table remains: {table}"
+        );
+    }
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM certificates", [], |row| row
+                .get::<_, i64>(0))
+            .expect("certificate count"),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM revocations", [], |row| row
+                .get::<_, i64>(0))
+            .expect("revocation count"),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT certificate_developer_id FROM developers WHERE id='developer-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("certificate Developer ID"),
+        "org.mochios.developer.developer1"
     );
 }
