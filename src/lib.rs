@@ -76,6 +76,18 @@ fn can_request_certificate(role: &str) -> bool {
     matches!(role, "owner" | "admin" | "developer")
 }
 
+fn certificate_issuance_eligible(
+    developer_status: &str,
+    verification_status: &str,
+    member_status: &str,
+    member_role: &str,
+) -> bool {
+    developer_status == "active"
+        && verification_status == "verified"
+        && member_status == "active"
+        && can_request_certificate(member_role)
+}
+
 fn valid_idempotency_key(value: &str) -> bool {
     (16..=128).contains(&value.len())
         && value
@@ -395,10 +407,15 @@ async fn issue_certificate(mut req: Request, ctx: RouteContext<()>) -> Result<Re
     let Some(developer) = store::developer(&db, developer_id).await? else {
         return error("DEVELOPER_NOT_FOUND", "Developer not found", 404);
     };
-    if developer.status != "active" || developer.verification_status != "verified" {
+    if !certificate_issuance_eligible(
+        &developer.status,
+        &developer.verification_status,
+        &member.status,
+        &member.role,
+    ) {
         return error(
             "DEVELOPER_NOT_ELIGIBLE",
-            "Developer must be active and verified",
+            "Developer and membership must be active, verified, and authorized",
             409,
         );
     }
@@ -1799,7 +1816,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
 #[cfg(test)]
 mod tests {
-    use super::etag_matches;
+    use super::{certificate_issuance_eligible, etag_matches};
 
     #[test]
     fn snapshot_etag_accepts_cloudflare_weak_and_list_validators() {
@@ -1861,5 +1878,36 @@ mod tests {
         assert!(!production.contains("admin_developer_policy"));
         assert!(store.contains("member.role IN ('owner', 'admin', 'developer')"));
         assert!(store.contains("'certificate.issued'"));
+    }
+
+    #[test]
+    fn only_active_verified_developers_and_issuing_roles_are_eligible() {
+        for role in ["owner", "admin", "developer"] {
+            assert!(certificate_issuance_eligible(
+                "active", "verified", "active", role
+            ));
+        }
+        for role in ["viewer", "unknown"] {
+            assert!(!certificate_issuance_eligible(
+                "active", "verified", "active", role
+            ));
+        }
+        for member_status in ["invited", "suspended", "removed"] {
+            assert!(!certificate_issuance_eligible(
+                "active",
+                "verified",
+                member_status,
+                "developer"
+            ));
+        }
+        assert!(!certificate_issuance_eligible(
+            "suspended",
+            "verified",
+            "active",
+            "owner"
+        ));
+        assert!(!certificate_issuance_eligible(
+            "active", "pending", "active", "owner"
+        ));
     }
 }

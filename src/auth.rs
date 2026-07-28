@@ -21,6 +21,12 @@ struct AccountState {
     status: String,
 }
 
+fn active_introspection_account(result: Introspection) -> Option<String> {
+    (result.active && result.account_status.as_deref() == Some("active"))
+        .then_some(result.account_id)
+        .flatten()
+}
+
 #[derive(Debug, Clone)]
 pub struct AdminActor {
     pub account_id: String,
@@ -73,11 +79,7 @@ pub async fn account(req: &Request, env: &worker::Env) -> Result<Option<String>>
         Ok(result) => result,
         Err(_) => return Ok(None),
     };
-    Ok(
-        (result.active && result.account_status.as_deref() == Some("active"))
-            .then_some(result.account_id)
-            .flatten(),
-    )
+    Ok(active_introspection_account(result))
 }
 
 pub async fn account_is_active(account_id: &str, env: &worker::Env) -> Result<bool> {
@@ -193,6 +195,37 @@ mod tests {
                 "developer-ca-admin",
                 "developer_ca_reviewer"
             ));
+        }
+    }
+
+    #[test]
+    fn session_introspection_requires_an_active_account() {
+        assert_eq!(
+            active_introspection_account(Introspection {
+                active: true,
+                account_id: Some("account-1".into()),
+                account_status: Some("active".into()),
+            }),
+            Some("account-1".into())
+        );
+        for result in [
+            Introspection {
+                active: false,
+                account_id: Some("account-1".into()),
+                account_status: Some("active".into()),
+            },
+            Introspection {
+                active: true,
+                account_id: Some("account-1".into()),
+                account_status: Some("suspended".into()),
+            },
+            Introspection {
+                active: true,
+                account_id: None,
+                account_status: Some("active".into()),
+            },
+        ] {
+            assert_eq!(active_introspection_account(result), None);
         }
     }
 }
