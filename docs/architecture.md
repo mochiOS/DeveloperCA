@@ -1,29 +1,15 @@
 # アーキテクチャ
 
 ```text
-Offline Root
-  └─署名─> Issuer Trust Snapshot ─登録─> DeveloperCA / D1
-                  ├─ active Intermediate
-                  ├─ retired Intermediate
-                  ├─ future Intermediate
-                  └─ revoked Intermediate
+オフラインRoot秘密鍵
+  └─ msign ─> Root直署名MCER v1 ─> Console ─> DeveloperCA / D1
 
-Online Intermediate ─署名─> Developer Certificate
-Trusted Intermediate ─署名─> 累積Revocation Snapshot
-
-Console ─短期署名token─> DeveloperCA ─Account再確認─> Accounts
+mochiOS・AppStore reviewer
+  └─ 組み込みRoot公開鍵でMCER v1を検証
 ```
 
-Offline Root秘密鍵はローカル専用CLIだけが使用します。WorkerはRoot公開鍵と、現在の
-Online Intermediate秘密鍵だけを保持します。発行と失効snapshot生成では、Worker鍵の
-公開鍵が現在のRoot署名付きsnapshotおよびD1 Issuer Registryと一致することを毎回確認
-します。一致しない場合はfail closedです。
+DeveloperCAは秘密鍵を保持せず、証明書を発行しません。登録時にMCER v1をdecodeし、設定済みRoot公開鍵による署名、有効期限、Developer ID、Package ID scope、Capabilityを検証します。D1にはMCERのBase64と検索・監査用metadataを保存します。
 
-一般利用者のAccounts Bearer token introspection経路は維持します。Console代理操作は
-`sub`にAccount IDを固定した60秒のdelegation tokenを使用します。管理操作も同じ署名
-基盤のadmin tokenを使用し、actorは`sub`だけから決定します。
+Consoleはログイン中のactive memberから証明書を受け取り、短期delegation tokenでDeveloperCAへ登録します。管理者向け操作はDeveloper確認、追加Developer申請の審査、証明書失効だけです。
 
-ConsoleのMPKG選択UIは端末内で`manifest.toml`を読み、`package.id`と全
-`binary.requires`をCertificateへ自動反映します。DeveloperCAは入力形式、確認済みかつ
-activeなDeveloper、active member role、Root署名済みtrust snapshot、Issuer Registryを
-検証し、同じリクエスト内で即時発行します。管理者によるissue/reject段階はありません。
+Intermediate CA、Issuer Registry、trust snapshot、オンライン署名鍵は使用しません。
