@@ -348,7 +348,6 @@ struct IdempotencyRow {
     request_hash: String,
     certificate_id: Option<String>,
     status: String,
-    updated_at: i64,
 }
 
 pub enum IssueClaim {
@@ -383,6 +382,38 @@ pub async fn claim_certificate_issue(
     request_hash: &str,
     now: i64,
 ) -> Result<IssueClaim> {
+    db.prepare(
+        "DELETE FROM certificate_issue_idempotency
+         WHERE updated_at<=?1",
+    )
+    .bind(&[number(now.saturating_sub(300))])?
+    .run()
+    .await?;
+    if let Some(row) = db
+        .prepare(
+            "SELECT request_hash,certificate_id,status
+             FROM certificate_issue_idempotency
+             WHERE developer_id=?1 AND account_id=?2 AND idempotency_key=?3",
+        )
+        .bind(&[
+            value(developer_id),
+            value(account_id),
+            value(idempotency_key),
+        ])?
+        .first::<IdempotencyRow>(None)
+        .await?
+    {
+        if row.request_hash != request_hash {
+            return Ok(IssueClaim::Conflict);
+        }
+        if row.status == "complete"
+            && let Some(certificate_id) = row.certificate_id
+            && let Some(certificate) = certificate(db, &certificate_id).await?
+        {
+            return Ok(IssueClaim::Complete(Box::new(certificate)));
+        }
+        return Ok(IssueClaim::Pending);
+    }
     let inserted = db
         .prepare(
             "INSERT OR IGNORE INTO certificate_issue_idempotency
@@ -406,53 +437,21 @@ pub async fn claim_certificate_issue(
     }
     let row = db
         .prepare(
-            "SELECT request_hash,certificate_id,status,updated_at
+            "SELECT request_hash,certificate_id,status
              FROM certificate_issue_idempotency
-             WHERE developer_id=?1 AND account_id=?2 AND idempotency_key=?3",
+             WHERE developer_id=?1 AND request_hash=?2",
         )
-        .bind(&[
-            value(developer_id),
-            value(account_id),
-            value(idempotency_key),
-        ])?
+        .bind(&[value(developer_id), value(request_hash)])?
         .first::<IdempotencyRow>(None)
         .await?
         .ok_or_else(|| worker::Error::RustError("idempotency state unavailable".into()))?;
-    if row.request_hash != request_hash {
-        return Ok(IssueClaim::Conflict);
-    }
     if row.status == "complete"
         && let Some(certificate_id) = row.certificate_id
         && let Some(certificate) = certificate(db, &certificate_id).await?
     {
         return Ok(IssueClaim::Complete(Box::new(certificate)));
     }
-    if row.updated_at > now.saturating_sub(300) {
-        return Ok(IssueClaim::Pending);
-    }
-    let reclaimed = db
-        .prepare(
-            "UPDATE certificate_issue_idempotency SET updated_at=?1
-             WHERE developer_id=?2 AND account_id=?3 AND idempotency_key=?4
-               AND status='pending' AND updated_at<=?5",
-        )
-        .bind(&[
-            number(now),
-            value(developer_id),
-            value(account_id),
-            value(idempotency_key),
-            number(now.saturating_sub(300)),
-        ])?
-        .run()
-        .await?
-        .meta()?
-        .and_then(|metadata| metadata.changes)
-        .is_some_and(|changes| changes == 1);
-    Ok(if reclaimed {
-        IssueClaim::Claimed
-    } else {
-        IssueClaim::Pending
-    })
+    Ok(IssueClaim::Pending)
 }
 
 pub async fn abandon_certificate_issue(

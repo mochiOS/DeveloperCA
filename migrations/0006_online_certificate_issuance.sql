@@ -100,6 +100,9 @@ CREATE TABLE certificate_issue_idempotency (
     PRIMARY KEY(developer_id, account_id, idempotency_key)
 );
 
+CREATE UNIQUE INDEX idx_certificate_issue_recent_request
+ON certificate_issue_idempotency(developer_id, request_hash);
+
 CREATE TABLE certificate_issuance_attempts (
     id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL,
