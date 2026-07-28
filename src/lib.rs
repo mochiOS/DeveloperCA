@@ -782,7 +782,7 @@ async fn certificate_status(_req: Request, ctx: RouteContext<()>) -> Result<Resp
     {
         return invalid("METADATA_MISMATCH");
     }
-    let valid_response = || {
+    let valid_response = |issuer_public_key: &[u8; 32], issuer_trust: &str| {
         json_response(
             &json!({
                 "certificate_id": certificate_id,
@@ -794,6 +794,11 @@ async fn certificate_status(_req: Request, ctx: RouteContext<()>) -> Result<Resp
                 "developer_record_id": row.developer_id,
                 "subject_key_id": certificate::hex(&parsed.subject_key_id),
                 "issuer_key_id": certificate::hex(&parsed.issuer_key_id),
+                "issuer_public_key": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    issuer_public_key,
+                ),
+                "issuer_trust": issuer_trust,
                 "not_before": parsed.not_before,
                 "not_after": parsed.not_after,
                 "issuance_source": row.issuance_source,
@@ -823,7 +828,7 @@ async fn certificate_status(_req: Request, ctx: RouteContext<()>) -> Result<Resp
                 "SIGNATURE_INVALID"
             });
         }
-        return valid_response();
+        return valid_response(&root_public_key, "legacy_root");
     }
     if row.issuance_source != "online_intermediate" {
         return invalid("ISSUER_UNKNOWN");
@@ -893,7 +898,7 @@ async fn certificate_status(_req: Request, ctx: RouteContext<()>) -> Result<Resp
             "SIGNATURE_INVALID"
         });
     }
-    valid_response()
+    valid_response(&public_key, "root_signed_trust_snapshot")
 }
 
 async fn require_admin(req: &Request, env: &Env) -> Result<Option<auth::AdminActor>> {
