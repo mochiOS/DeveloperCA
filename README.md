@@ -1,12 +1,44 @@
-# mochiOS DeveloperCA
+# mochiOS Developer CA
 
-DeveloperCAはDeveloperアカウントと、オフラインで発行されたDeveloper Certificateの登録・失効状態を管理するCloudflare Workerです。Rustと`workers-rs`で実装し、状態はD1へ保存します。
+一般開発者へDeveloper Certificate（MCER v1）を発行し、Developer、Member、証明書、Issuer trust、失効状態を管理するRust／`workers-rs`製Cloudflare Workerです。状態はD1へ保存します。
 
-証明書の正本は`mochios-certificate` crateが定義するMCER v1です。証明書はmochiOSリポジトリの`tools/devkit/crates/msign`でRoot秘密鍵を使ってオフライン発行し、ConsoleからMCERファイルを登録します。WorkerはRoot公開鍵で署名・有効期限・Package ID scope・Capabilityを検証します。管理者は証明書を発行・承認せず、失効だけを行います。
+通常発行はOnline Intermediateを使用します。Offline Root秘密鍵はCloudへ置かず、Root署名済みTrust Snapshotだけを登録します。
 
-D1の内部Developer UUIDとは別に、MCERへ格納する`certificate_developer_id`（`org.mochios.developer.<uuid>`）を各Developerへ割り当てます。`msign certificate issue --developer-id`にはConsoleに表示されるこの値を指定します。
+```text
+Offline Root
+  └─ Root署名済みTrust Snapshot
+       └─ Online Intermediate
+            └─ developer.cert（MCER v1）
+```
 
-Root秘密鍵をWorker、D1、CI、`.dev.vars`へ置いてはいけません。
+開発者はConsoleで`application.pub`とunsigned `.mpkg`を選択します。MPKGはブラウザ内だけで解析され、APIへ届くのは公開鍵、完全一致Package ID、Capability集合だけです。Developerがactiveかつverifiedで、呼出Accountがactiveなowner／admin／developer Memberなら、人によるCertificate審査なしで即時発行します。viewerは一覧と再取得だけ可能です。
+
+## API
+
+```text
+POST /v1/developers/:developer_id/certificates/issue
+GET  /v1/developers/:developer_id/certificates
+GET  /v1/certificates/:certificate_id
+GET  /v1/certificates/:certificate_id/status
+GET  /v1/trust-store
+GET  /v1/trust-store/:snapshot_version
+GET  /v1/revocations
+GET  /v1/revocations/:snapshot_version
+POST /v1/admin/trust-snapshots
+POST /v1/admin/certificates/:certificate_id/revoke
+```
+
+発行入力:
+
+```json
+{
+  "subject_public_key": "<Base64または64桁hexのEd25519公開鍵>",
+  "package_id": "org.mochios.example",
+  "capabilities": ["fs.read.all", "window.create"]
+}
+```
+
+`X-Idempotency-Key`が必須です。成功応答の`certificate`がBase64のraw MCER bytesです。秘密鍵やMPKGを受理するfieldはありません。
 
 ## ローカル確認
 
@@ -15,28 +47,9 @@ rustup target add wasm32-unknown-unknown
 cargo install worker-build
 npx wrangler d1 migrations apply mochios-developer-ca --local
 cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
 cargo check --target wasm32-unknown-unknown
 npx wrangler dev
 ```
 
-`.dev.vars`には次を設定します。
-
-```text
-SERVICE_TOKEN=<Accounts内部API用token>
-CONSOLE_TOKEN_PUBLIC_KEY=<Console短期token署名鍵のBase64 Ed25519公開鍵>
-MOCHIOS_ROOT_PUBLIC_KEYS_HEX=<Root Ed25519公開鍵の64文字hex。複数はカンマ区切り>
-```
-
-## 証明書API
-
-```text
-POST /v1/developers/:developer_id/certificates/register
-GET  /v1/developers/:developer_id/certificates
-GET  /v1/certificates/:certificate_id
-GET  /v1/certificates/:certificate_id/status
-GET  /v1/trust-store
-GET  /v1/revocations
-POST /v1/admin/certificates/:certificate_id/revoke
-```
-
-登録リクエストは`{"certificate":"<MCER v1のBase64>"}`です。
+Secret、Trust Snapshot登録、本番反映は[docs/deployment.md](docs/deployment.md)を参照してください。証明書発行の詳細は[docs/certificate-format.md](docs/certificate-format.md)、全体フローは[docs/architecture.md](docs/architecture.md)にあります。

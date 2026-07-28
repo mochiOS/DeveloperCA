@@ -1,13 +1,20 @@
-# Developer Certificate形式
+# Developer Certificate発行
 
-証明書は`mochios-certificate` crateが定義するMCER v1 binaryです。署名メッセージは次のdomain separatorを用います。
+証明書のwire正本は共有`mochios-certificate` crateのMCER v1です。Developer CAは独自JSON証明書を生成せず、共有crateでencode・署名したraw bytesを保存して返します。
 
-```text
-mochios-certificate-v1\0 || canonical_certificate_bytes
-```
+通常のConsole発行では次を固定します。
 
-証明書にはserial number、Root key ID、Developer ID、subject Ed25519公開鍵、有効期間、Package ID scope、許可Capability、Root署名が含まれます。Issuer key IDは証明書へ署名したRoot公開鍵から導出します。
+- Developer ID: D1内部UUIDとは別の`certificate_developer_id`
+- Subject public key: `application.pub`のEd25519公開鍵
+- Subject Key ID: 公開鍵32 bytesのSHA-256
+- Package scope: `package.id`への完全一致1件
+- Allowed Capability: 全`[[binary]].requires`のソート済み和集合
+- Key usage: package signing
+- Issuer: current Root署名Trust Snapshotのactive Online Intermediate
+- 有効期限: Issuer期限と1年上限の短い方
 
-DeveloperCAの内部UUIDはMCERのDeveloper IDに使いません。Consoleが表示する小文字の`certificate_developer_id`を`msign certificate issue --developer-id`へ指定します。
+API応答の`certificate`はBase64 MCER、`certificate_details`は表示用の派生情報です。`developer.cert`へ保存するのは`certificate`をdecodeしたbytesです。
 
-JSONは表示・API用の派生表現です。検証の正本には必ずraw MCER bytesを使用します。詳細なwire layoutはmochiOSの`docs/certificates.md`を正本とします。
+`application.key`は送信しません。32-byte秘密鍵seedを64-byteの公開鍵として送る入力や、未知field、不正Package ID、不正・重複Capability、512件超のCapability、16 KiB超のbodyは拒否します。32-byte seedと32-byte公開鍵はbyte列だけでは区別できないため、Consoleは`.key`ファイル名を拒否し、Developer CAはEd25519公開鍵としてdecodeできる入力だけを受理します。
+
+管理者による発行承認はありません。管理者のCertificate操作は失効だけです。

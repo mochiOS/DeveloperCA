@@ -1,7 +1,16 @@
 # 証明書ポリシー
 
-証明書登録者はactiveかつverifiedなDeveloperのactive owner、admin、developerに限ります。登録するMCER v1のDeveloper IDは対象Developerと一致し、Root直署名が有効でなければなりません。
+- 発行可: active Accountかつactive owner／admin／developer Member
+- 一覧・取得可: active Member（viewerを含む）
+- Developer条件: `status=active`かつ`verification_status=verified`
+- Package scope: Consoleが抽出したPackage IDへの完全一致1件
+- Capability: Consoleが抽出した全`[[binary]].requires`の和集合
+- Certificate審査: なし
+- 管理者操作: 失効のみ
+- body上限: 16 KiB
+- Capability上限: 512
+- 有効期限上限: 1年かIssuer期限まで
+- 発行制限: Account 20件/時、Developer 20件/時、Subject key 10件/時
+- 同一内容: 同時実行と5分以内は既存Certificateを返す
 
-Package ID scopeとCapabilityは`msign`が証明書へ固定します。DeveloperCAは値を変更せず検証・保存します。CertificateのCapabilityはOS実行時認可の上限であり、AppStore審査の代替ではありません。
-
-管理者は証明書を発行・承認・却下しません。可能なCertificate操作は失効だけです。
+prefix scopeを一般Developerが指定するUIや、Account IDをrequest bodyからactorとして受け取るAPIはありません。

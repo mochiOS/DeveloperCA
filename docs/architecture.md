@@ -1,15 +1,22 @@
 # アーキテクチャ
 
 ```text
-オフラインRoot秘密鍵
-  └─ msign ─> Root直署名MCER v1 ─> Console ─> DeveloperCA / D1
-
-mochiOS・AppStore reviewer
-  └─ 組み込みRoot公開鍵でMCER v1を検証
+application.key ── 開発者端末だけで保持
+application.pub ─┐
+unsigned .mpkg ──┴─> Consoleのブラウザ内解析
+                         └─ 公開鍵・Package ID・Capabilityのみ
+                                      ↓ Service Binding + 60秒delegation token
+Accounts <── active確認 ── Developer CA Worker
+                              ├─ Developer／Member確認
+Offline Root公開鍵 ───────────┤─ Trust Snapshot検証
+Online Intermediate秘密鍵 ───┤─ 公開鍵一致確認
+                              └─ MCER v1発行／D1保存
+                                      ↓
+                                 developer.cert
 ```
 
-DeveloperCAは秘密鍵を保持せず、証明書を発行しません。登録時にMCER v1をdecodeし、設定済みRoot公開鍵による署名、有効期限、Developer ID、Package ID scope、Capabilityを検証します。D1にはMCERのBase64と検索・監査用metadataを保存します。
+発行直前にAccount、Developer、Member、入力、現在のRoot署名Trust Snapshot、active Issuer、有効期間、Worker秘密鍵から導出した公開鍵を再確認します。不一致はすべてfail closedです。
 
-Consoleはログイン中のactive memberから証明書を受け取り、短期delegation tokenでDeveloperCAへ登録します。管理者向け操作はDeveloper確認、追加Developer申請の審査、証明書失効だけです。
+D1 batchはCertificate request、Certificate record、発行Account、発行経路、idempotency完了、監査ログを一貫して保存します。serialはD1の単調増加sequenceから予約し、途中失敗でも再利用しません。同一内容の同時実行と5分以内の再送は同じCertificateへ集約し、その後は意図的な再発行を許可します。
 
-Intermediate CA、Issuer Registry、trust snapshot、オンライン署名鍵は使用しません。
+既存Root直署名Certificateは`issuance_source=legacy_root`として保持し、Offline Root公開鍵で検証を継続します。新規の一般発行だけを`online_intermediate`へ限定します。

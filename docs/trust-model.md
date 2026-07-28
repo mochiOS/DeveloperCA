@@ -1,5 +1,9 @@
 # 信頼モデル
 
-Developer CertificateはRootが直接署名します。mochiOSは信頼するRoot公開鍵をOS imageへ組み込み、MCER v1のissuer key IDと署名を照合します。GitHub、DeveloperCA、AppStoreへ保存されていること自体は信頼根拠ではありません。
+新規一般発行はOffline Rootが直接署名せず、Root署名済みTrust Snapshotで権限を与えたOnline IntermediateがMCER v1へ署名します。
 
-Root秘密鍵はオフライン環境の`msign`だけで使用します。Cloudflare Worker、D1、CI、開発者ブラウザーへ配布しません。Root公開鍵の変更はOS更新として扱います。
+Trust SnapshotはRoot key ID、世代、生成・失効時刻、全Issuerの公開鍵・状態・用途・有効期間、Root署名を含みます。current SnapshotはRoot公開鍵で検証され、Issuerは最大1件だけactiveです。既存Issuerの公開鍵差し替え、Snapshot rollback、Issuer省略、revokedからの復帰を拒否します。
+
+発行時はWorker SecretのOnline Intermediate秘密鍵から公開鍵とkey IDを導出し、SnapshotとIssuer Registryのactive recordへ完全一致させます。保存場所やCloudflare自体は信頼根拠ではありません。
+
+既存Root直署名MCERは`legacy_root`としてRoot公開鍵による検証を続けます。新規一般発行ではこの経路を使用しません。

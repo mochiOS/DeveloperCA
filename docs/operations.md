@@ -1,9 +1,14 @@
 # 運用
 
-1. オフライン環境でmochiOSの`tools/devkit/crates/msign`を使用し、Root直署名MCER v1を発行します。
-2. 開発者へMCERファイルと、対応するsubject秘密鍵を安全に引き渡します。Root秘密鍵は引き渡しません。
-3. 開発者はConsoleからMCERファイルを登録します。
-4. AppStore reviewerはMPKG内の`signatures/developer.cert`をRoot公開鍵で検証します。
-5. 失効時はConsoleの管理画面で証明書を失効し、serial一覧を次回のOS imageへ反映します。
+一般開発者は`msign key generate`で`application.key`と`application.pub`を作り、Consoleで公開鍵とunsigned MPKGを選択して`developer.cert`を取得します。その後、開発者端末で次を実行します。
 
-具体的な`msign`コマンドとファイル形式はmochiOSの`docs/certificates.md`、`docs/mpkg.md`、`docs/packages.md`を正本とします。Root鍵操作はネットワークから隔離した端末で行い、バックアップ媒体とアクセス記録を管理します。
+```powershell
+msign package sign application.mpkg --certificate developer.cert --key application.key --output application-signed.mpkg
+msign package verify application-signed.mpkg --root-public-key <trusted-key> --unix-time <unix>
+```
+
+`kome sign`はlegacy `.pkg`用です。MPKGのDeveloper Certificate付き署名には`msign package sign`を使用します。
+
+運営者はOffline Root、Trust Snapshot、Issuerローテーションを管理します。一般発行へRoot秘密鍵を使いません。Issuerローテーションは新IssuerをfutureとしてSnapshotへ追加し、新しいSnapshotでactiveを切り替え、旧Issuerをretired、侵害時はrevokedへ単調に遷移させます。
+
+Certificate失効はConsole管理画面からreason codeと説明を付けて行います。失効serialは再利用しません。AppStoreは登録、Reviewer報告、公開承認の各段階でDeveloper CA statusを確認します。

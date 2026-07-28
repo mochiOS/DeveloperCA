@@ -1,7 +1,7 @@
 # 失効
 
-管理者は登録済み証明書だけを失効できます。D1の失効記録は監査とAppStoreのオンライン確認に使います。
+管理者は発行済みCertificateだけを失効できます。失効はCertificate record、serial、reason code、説明、actor、時刻へ保存し、Online Intermediateで署名したRevocation Snapshotを更新します。
 
-mochiOSの権威ある失効判定はオンラインCRL／OCSPではなく、OS imageへ組み込んだserial一覧です。DeveloperCAの`GET /v1/revocations`からserialを取得し、`signature.service`のbuild時に`MOCHIOS_REVOKED_CERTIFICATE_SERIALS`へ反映してOSを更新します。
+Developer CAのstatus APIはD1のCertificate状態と失効recordを最初に確認し、失効済みならMCER署名が正しくても`valid=false`、`reason=CERTIFICATE_REVOKED`を返します。AppStoreはReviewer結果の受理時と公開承認時にstatusを再確認します。
 
-失効済みserialを再利用してはいけません。
+既存Root直署名CertificateとOnline Intermediate発行Certificateのどちらも同じserial単位で失効します。serialは再利用しません。
