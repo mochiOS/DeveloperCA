@@ -174,11 +174,13 @@ async fn list_developers(req: Request, ctx: RouteContext<()>) -> Result<Response
 
 async fn get_developer(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let developer_id = param(&ctx, "developer_id");
-    if membership(&req, &ctx, developer_id).await?.is_none() {
+    let Some(member) = membership(&req, &ctx, developer_id).await? else {
         return error("FORBIDDEN", "Active membership required", 403);
-    }
+    };
     match store::developer(&ctx.env.d1("DB")?, developer_id).await? {
-        Some(developer) => json_response(&json!({"developer": developer}), 200),
+        Some(developer) => {
+            json_response(&json!({"developer": developer, "membership": member}), 200)
+        }
         None => error("DEVELOPER_NOT_FOUND", "Developer not found", 404),
     }
 }
