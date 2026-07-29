@@ -447,7 +447,10 @@ async fn issue_certificate(mut req: Request, ctx: RouteContext<()>) -> Result<Re
     )
     .await?
     {
-        store::IssueClaim::Complete(row) => return json_response(&certificate_view(*row)?, 200),
+        store::IssueClaim::Complete(row) => {
+            let issuer_public_key = certificate_issuer_public_key(&ctx.env, &db, &row).await?;
+            return json_response(&certificate_view(*row, &issuer_public_key)?, 200);
+        }
         store::IssueClaim::Conflict => {
             return error(
                 "IDEMPOTENCY_KEY_CONFLICT",
@@ -589,7 +592,7 @@ async fn issue_certificate(mut req: Request, ctx: RouteContext<()>) -> Result<Re
     )
     .await?;
     match row {
-        Some(row) => json_response(&certificate_view(row)?, 201),
+        Some(row) => json_response(&certificate_view(row, &issuer.public_key)?, 201),
         None => {
             store::abandon_certificate_issue(
                 &db,
@@ -648,14 +651,40 @@ async fn list_certificates(req: Request, ctx: RouteContext<()>) -> Result<Respon
     if !authorized {
         return error("FORBIDDEN", "Active membership required", 403);
     }
-    let rows = store::list_certificates(&ctx.env.d1("DB")?, developer_id).await?;
-    json_response(
-        &json!({"certificates": rows.into_iter().map(certificate_view).collect::<Result<Vec<_>>>()?}),
-        200,
-    )
+    let db = ctx.env.d1("DB")?;
+    let rows = store::list_certificates(&db, developer_id).await?;
+    let mut certificates = Vec::with_capacity(rows.len());
+    for row in rows {
+        let issuer_public_key = certificate_issuer_public_key(&ctx.env, &db, &row).await?;
+        certificates.push(certificate_view(row, &issuer_public_key)?);
+    }
+    json_response(&json!({"certificates": certificates}), 200)
 }
 
-fn certificate_view(row: CertificateRow) -> Result<serde_json::Value> {
+async fn certificate_issuer_public_key(
+    env: &Env,
+    db: &D1Database,
+    row: &CertificateRow,
+) -> Result<String> {
+    let public_key = if row.issuance_source == "legacy_root" {
+        env.secret("OFFLINE_ROOT_PUBLIC_KEY")?.to_string()
+    } else {
+        store::issuer(db, &row.issuer_key_id)
+            .await?
+            .ok_or_else(|| Error::RustError("certificate issuer is unavailable".into()))?
+            .public_key
+    };
+    let decoded = mochios_developer_ca_trust::decode_public_key(&public_key)
+        .map_err(|_| Error::RustError("certificate issuer public key is invalid".into()))?;
+    if mochios_developer_ca_trust::key_id(&decoded) != row.issuer_key_id {
+        return Err(Error::RustError(
+            "certificate issuer public key does not match its key ID".into(),
+        ));
+    }
+    Ok(public_key)
+}
+
+fn certificate_view(row: CertificateRow, issuer_public_key: &str) -> Result<serde_json::Value> {
     let certificate =
         certificate::decode_base64(&row.certificate_json).map_err(Error::RustError)?;
     Ok(json!({
@@ -669,6 +698,7 @@ fn certificate_view(row: CertificateRow) -> Result<serde_json::Value> {
         "not_before": certificate.not_before,
         "not_after": certificate.not_after,
         "issuance_source": row.issuance_source,
+        "issuer_public_key": issuer_public_key,
         "certificate": row.certificate_json,
         "certificate_details": certificate::view(&certificate),
         "certificate_wire": row.certificate_json,
@@ -676,7 +706,8 @@ fn certificate_view(row: CertificateRow) -> Result<serde_json::Value> {
 }
 
 async fn get_certificate(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    match store::certificate(&ctx.env.d1("DB")?, param(&ctx, "certificate_id")).await? {
+    let db = ctx.env.d1("DB")?;
+    match store::certificate(&db, param(&ctx, "certificate_id")).await? {
         Some(row) => {
             let cli = auth::cli(&req, &ctx.env).await?;
             let authorized = if let Some(cli) = cli {
@@ -694,7 +725,8 @@ async fn get_certificate(req: Request, ctx: RouteContext<()>) -> Result<Response
             if !authorized {
                 return error("FORBIDDEN", "Active membership required", 403);
             }
-            json_response(&certificate_view(row)?, 200)
+            let issuer_public_key = certificate_issuer_public_key(&ctx.env, &db, &row).await?;
+            json_response(&certificate_view(row, &issuer_public_key)?, 200)
         }
         None => error("CERTIFICATE_NOT_FOUND", "Certificate not found", 404),
     }
@@ -1255,11 +1287,12 @@ async fn admin_review_queue(req: Request, ctx: RouteContext<()>) -> Result<Respo
     let db = ctx.env.d1("DB")?;
     let developers = store::manageable_developers(&db).await?;
     let developer_creation_requests = store::pending_creation_reviews(&db).await?;
-    let certificates = store::active_certificates(&db)
-        .await?
-        .into_iter()
-        .map(certificate_view)
-        .collect::<Result<Vec<_>>>()?;
+    let rows = store::active_certificates(&db).await?;
+    let mut certificates = Vec::with_capacity(rows.len());
+    for row in rows {
+        let issuer_public_key = certificate_issuer_public_key(&ctx.env, &db, &row).await?;
+        certificates.push(certificate_view(row, &issuer_public_key)?);
+    }
     json_response(
         &json!({
             "developers": developers,
@@ -1370,8 +1403,9 @@ async fn admin_set_certificate_suspension(
     if !consume_admin_action(&actor, &ctx.env, operation).await? {
         return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
     }
+    let db = ctx.env.d1("DB")?;
     let certificate = store::set_certificate_suspension(
-        &ctx.env.d1("DB")?,
+        &db,
         param(&ctx, "certificate_id"),
         suspended,
         &actor.account_id,
@@ -1398,7 +1432,8 @@ async fn admin_set_certificate_suspension(
         now(),
     )
     .await?;
-    json_response(&certificate_view(certificate)?, 200)
+    let issuer_public_key = certificate_issuer_public_key(&ctx.env, &db, &certificate).await?;
+    json_response(&certificate_view(certificate, &issuer_public_key)?, 200)
 }
 
 async fn admin_creation_review(
@@ -1872,7 +1907,8 @@ async fn admin_revoke(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
                 now(),
             )
             .await?;
-            json_response(&certificate_view(row)?, 200)
+            let issuer_public_key = certificate_issuer_public_key(&ctx.env, &db, &row).await?;
+            json_response(&certificate_view(row, &issuer_public_key)?, 200)
         }
         None => error("CERTIFICATE_NOT_FOUND", "Certificate not found", 404),
     }
@@ -2029,6 +2065,7 @@ mod tests {
         assert!(production.contains("/v1/admin/certificates/:certificate_id/suspend"));
         assert!(production.contains("/v1/admin/certificates/:certificate_id/restore"));
         assert!(production.contains("/v1/admin/developers/:developer_id/restore"));
+        assert!(production.contains("\"issuer_public_key\": issuer_public_key"));
         assert!(!production.contains("/v1/admin/certificate-requests"));
         assert!(!production.contains("admin_developer_policy"));
         assert!(store.contains("member.role IN ('owner', 'admin', 'developer')"));
