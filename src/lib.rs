@@ -345,7 +345,23 @@ async fn list_creation_requests(req: Request, ctx: RouteContext<()>) -> Result<R
 
 async fn issue_certificate(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let developer_id = param(&ctx, "developer_id");
-    let Some(member) = membership(&req, &ctx, developer_id).await? else {
+    let Some(cli) = auth::cli(&req, &ctx.env).await? else {
+        return error(
+            "CLI_AUTH_REQUIRED",
+            "A valid Kome CLI access token is required",
+            401,
+        );
+    };
+    if !cli.scopes.iter().any(|scope| scope == "certificate.issue") {
+        return error(
+            "INSUFFICIENT_SCOPE",
+            "certificate.issue scope is required",
+            403,
+        );
+    }
+    let Some(member) =
+        store::member_for_account(&ctx.env.d1("DB")?, developer_id, &cli.account_id).await?
+    else {
         return error("FORBIDDEN", "Active membership required", 403);
     };
     if !can_request_certificate(&member.role) {
@@ -592,9 +608,44 @@ async fn issue_certificate(mut req: Request, ctx: RouteContext<()>) -> Result<Re
     }
 }
 
+async fn cli_developers(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let Some(cli) = auth::cli(&req, &ctx.env).await? else {
+        return error(
+            "CLI_AUTH_REQUIRED",
+            "A valid Kome CLI access token is required",
+            401,
+        );
+    };
+    if !cli.scopes.iter().any(|scope| scope == "developer.read") {
+        return error(
+            "INSUFFICIENT_SCOPE",
+            "developer.read scope is required",
+            403,
+        );
+    }
+    let db = ctx.env.d1("DB")?;
+    let mut output = Vec::new();
+    for developer in store::list_developers(&db, &cli.account_id).await? {
+        if let Some(member) = store::member_for_account(&db, &developer.id, &cli.account_id).await?
+        {
+            output.push(json!({"id":developer.id,"display_name":developer.display_name,"status":developer.status,"verification_status":developer.verification_status,"role":member.role,"can_issue":can_request_certificate(&member.role)}));
+        }
+    }
+    json_response(&json!({"developers":output}), 200)
+}
+
 async fn list_certificates(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let developer_id = param(&ctx, "developer_id");
-    if membership(&req, &ctx, developer_id).await?.is_none() {
+    let cli = auth::cli(&req, &ctx.env).await?;
+    let authorized = if let Some(cli) = cli {
+        cli.scopes.iter().any(|scope| scope == "certificate.read")
+            && store::member_for_account(&ctx.env.d1("DB")?, developer_id, &cli.account_id)
+                .await?
+                .is_some()
+    } else {
+        membership(&req, &ctx, developer_id).await?.is_some()
+    };
+    if !authorized {
         return error("FORBIDDEN", "Active membership required", 403);
     }
     let rows = store::list_certificates(&ctx.env.d1("DB")?, developer_id).await?;
@@ -627,7 +678,20 @@ fn certificate_view(row: CertificateRow) -> Result<serde_json::Value> {
 async fn get_certificate(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     match store::certificate(&ctx.env.d1("DB")?, param(&ctx, "certificate_id")).await? {
         Some(row) => {
-            if membership(&req, &ctx, &row.developer_id).await?.is_none() {
+            let cli = auth::cli(&req, &ctx.env).await?;
+            let authorized = if let Some(cli) = cli {
+                cli.scopes.iter().any(|scope| scope == "certificate.read")
+                    && store::member_for_account(
+                        &ctx.env.d1("DB")?,
+                        &row.developer_id,
+                        &cli.account_id,
+                    )
+                    .await?
+                    .is_some()
+            } else {
+                membership(&req, &ctx, &row.developer_id).await?.is_some()
+            };
+            if !authorized {
                 return error("FORBIDDEN", "Active membership required", 403);
             }
             json_response(&certificate_view(row)?, 200)
@@ -1747,6 +1811,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .options_async("/health", |_, _| async { health_preflight() })
         .post_async("/v1/developers", create_developer)
         .get_async("/v1/developers", list_developers)
+        .get_async("/v1/cli/developers", cli_developers)
         .get_async("/v1/developers/:developer_id", get_developer)
         .get_async("/v1/developers/:developer_id/members", list_members)
         .post_async("/v1/developers/:developer_id/members", add_member)
