@@ -122,10 +122,10 @@ pub async fn list_developers(db: &D1Database, account_id: &str) -> Result<Vec<De
     ).bind(&[value(account_id)])?).await
 }
 
-pub async fn pending_developer_reviews(db: &D1Database) -> Result<Vec<Developer>> {
+pub async fn manageable_developers(db: &D1Database) -> Result<Vec<Developer>> {
     all(db.prepare(
         "SELECT id, certificate_developer_id, developer_type, display_name, status, verification_status, created_at, updated_at
-         FROM developers WHERE status='active' AND verification_status='pending' ORDER BY created_at",
+         FROM developers WHERE status IN ('active','suspended') ORDER BY created_at DESC",
     )).await
 }
 

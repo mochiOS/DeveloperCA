@@ -1253,7 +1253,7 @@ async fn admin_review_queue(req: Request, ctx: RouteContext<()>) -> Result<Respo
         return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
     }
     let db = ctx.env.d1("DB")?;
-    let developers = store::pending_developer_reviews(&db).await?;
+    let developers = store::manageable_developers(&db).await?;
     let developer_creation_requests = store::pending_creation_reviews(&db).await?;
     let certificates = store::active_certificates(&db)
         .await?
@@ -2017,7 +2017,7 @@ mod tests {
     }
 
     #[test]
-    fn certificate_issuance_is_self_service_and_admin_can_only_revoke() {
+    fn certificate_issuance_is_self_service_and_admin_can_suspend_or_revoke() {
         let source = include_str!("lib.rs");
         let production = source.split("#[cfg(test)]").next().unwrap_or_default();
         let store = include_str!("store.rs");
@@ -2026,6 +2026,9 @@ mod tests {
         assert!(production.contains("require_admin(&req, &ctx.env)"));
         assert!(production.contains("active_certificates(&db)"));
         assert!(production.contains("/v1/admin/certificates/:certificate_id/revoke"));
+        assert!(production.contains("/v1/admin/certificates/:certificate_id/suspend"));
+        assert!(production.contains("/v1/admin/certificates/:certificate_id/restore"));
+        assert!(production.contains("/v1/admin/developers/:developer_id/restore"));
         assert!(!production.contains("/v1/admin/certificate-requests"));
         assert!(!production.contains("admin_developer_policy"));
         assert!(store.contains("member.role IN ('owner', 'admin', 'developer')"));
