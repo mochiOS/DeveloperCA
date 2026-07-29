@@ -834,6 +834,9 @@ async fn certificate_status(_req: Request, ctx: RouteContext<()>) -> Result<Resp
     {
         return invalid("CERTIFICATE_REVOKED");
     }
+    if row.status == "suspended" {
+        return invalid("CERTIFICATE_SUSPENDED");
+    }
     if row.status != "active" {
         return invalid("METADATA_MISMATCH");
     }
@@ -1301,16 +1304,26 @@ async fn admin_verification(mut req: Request, ctx: RouteContext<()>) -> Result<R
     json_response(&json!({"developer": developer}), 200)
 }
 
-async fn admin_suspend(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+async fn admin_set_developer_suspension(
+    req: Request,
+    ctx: RouteContext<()>,
+    suspended: bool,
+) -> Result<Response> {
     let Some(actor) = require_admin(&req, &ctx.env).await? else {
         return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
     };
-    if !consume_admin_action(&actor, &ctx.env, "developer.suspend").await? {
+    let operation = if suspended {
+        "developer.suspend"
+    } else {
+        "developer.restore"
+    };
+    if !consume_admin_action(&actor, &ctx.env, operation).await? {
         return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
     }
-    let developer = store::suspend_developer(
+    let developer = store::set_developer_suspension(
         &ctx.env.d1("DB")?,
         param(&ctx, "developer_id"),
+        suspended,
         &actor.account_id,
         now(),
     )
@@ -1319,12 +1332,73 @@ async fn admin_suspend(req: Request, ctx: RouteContext<()>) -> Result<Response> 
         &ctx.env.d1("DB")?,
         Some(param(&ctx, "developer_id")),
         &actor.account_id,
-        "admin.developer.suspend",
+        &format!("admin.{operation}"),
         &actor.jti,
         now(),
     )
     .await?;
     json_response(&json!({"developer": developer}), 200)
+}
+
+async fn admin_set_certificate_suspension(
+    mut req: Request,
+    ctx: RouteContext<()>,
+    suspended: bool,
+) -> Result<Response> {
+    let Some(actor) = require_admin(&req, &ctx.env).await? else {
+        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
+    };
+    let reason = if suspended {
+        let input: SuspensionInput = req.json().await?;
+        let reason = input.reason.trim().to_owned();
+        if reason.is_empty() || reason.len() > 2000 {
+            return error(
+                "SUSPENSION_REASON_REQUIRED",
+                "Suspension reason required",
+                422,
+            );
+        }
+        Some(reason)
+    } else {
+        None
+    };
+    let operation = if suspended {
+        "certificate.suspend"
+    } else {
+        "certificate.restore"
+    };
+    if !consume_admin_action(&actor, &ctx.env, operation).await? {
+        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
+    }
+    let certificate = store::set_certificate_suspension(
+        &ctx.env.d1("DB")?,
+        param(&ctx, "certificate_id"),
+        suspended,
+        &actor.account_id,
+        reason.as_deref(),
+        now(),
+    )
+    .await?;
+    let Some(certificate) = certificate else {
+        return error("CERTIFICATE_NOT_FOUND", "Certificate not found", 404);
+    };
+    if certificate.status == "revoked" {
+        return error(
+            "CERTIFICATE_REVOKED",
+            "Revoked certificate cannot be restored",
+            409,
+        );
+    }
+    store::record_admin_audit(
+        &ctx.env.d1("DB")?,
+        Some(&certificate.developer_id),
+        &actor.account_id,
+        &format!("admin.{operation}"),
+        &actor.jti,
+        now(),
+    )
+    .await?;
+    json_response(&certificate_view(certificate)?, 200)
 }
 
 async fn admin_creation_review(
@@ -1746,7 +1820,7 @@ async fn admin_revoke(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     let Some(certificate) = store::certificate(&db, certificate_id).await? else {
         return error("CERTIFICATE_NOT_FOUND", "Certificate not found", 404);
     };
-    if certificate.status != "active" {
+    if !matches!(certificate.status.as_str(), "active" | "suspended") {
         return error("CERTIFICATE_NOT_ACTIVE", "Certificate is not active", 409);
     }
     let reason_code = input
@@ -1862,7 +1936,12 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             "/v1/admin/developers/:developer_id/verification",
             admin_verification,
         )
-        .post_async("/v1/admin/developers/:developer_id/suspend", admin_suspend)
+        .post_async("/v1/admin/developers/:developer_id/suspend", |req, ctx| {
+            admin_set_developer_suspension(req, ctx, true)
+        })
+        .post_async("/v1/admin/developers/:developer_id/restore", |req, ctx| {
+            admin_set_developer_suspension(req, ctx, false)
+        })
         .post_async(
             "/v1/admin/developer-creation-requests/:request_id/approve",
             |req, ctx| admin_creation_review(req, ctx, "approved"),
@@ -1870,6 +1949,14 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async(
             "/v1/admin/developer-creation-requests/:request_id/reject",
             |req, ctx| admin_creation_review(req, ctx, "rejected"),
+        )
+        .post_async(
+            "/v1/admin/certificates/:certificate_id/suspend",
+            |req, ctx| admin_set_certificate_suspension(req, ctx, true),
+        )
+        .post_async(
+            "/v1/admin/certificates/:certificate_id/restore",
+            |req, ctx| admin_set_certificate_suspension(req, ctx, false),
         )
         .post_async(
             "/v1/admin/certificates/:certificate_id/revoke",

@@ -5,3 +5,4 @@
 Developer CAのstatus APIはD1のCertificate状態と失効recordを最初に確認し、失効済みならMCER署名が正しくても`valid=false`、`reason=CERTIFICATE_REVOKED`を返します。AppStoreはReviewer結果の受理時と公開承認時にstatusを再確認します。
 
 既存Root直署名CertificateとOnline Intermediate発行Certificateのどちらも同じserial単位で失効します。serialは再利用しません。
+証明書の一時停止は失効と分離されています。管理者はインシデント調査中に証明書を停止し、問題がなければ再開できます。停止中の証明書はstatus APIで`CERTIFICATE_SUSPENDED`としてfail closedになります。失効は引き続き不可逆で、署名済みrevocation snapshotへ記録されます。

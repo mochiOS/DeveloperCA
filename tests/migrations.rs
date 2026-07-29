@@ -9,6 +9,65 @@ const CERTIFICATE_DEVELOPER_ID: &str =
     include_str!("../migrations/0005_certificate_developer_id.sql");
 const ONLINE_ISSUANCE: &str = include_str!("../migrations/0006_online_certificate_issuance.sql");
 const UUID_DEVELOPER_IDS: &str = include_str!("../migrations/0007_uuid_developer_ids.sql");
+const AUTOMATIC_DEVELOPER_VERIFICATION: &str =
+    include_str!("../migrations/0008_automatic_developer_verification.sql");
+const CERTIFICATE_SUSPENSIONS: &str =
+    include_str!("../migrations/0009_certificate_suspensions.sql");
+
+#[test]
+fn developer_and_certificate_suspensions_are_reversible() {
+    let connection = Connection::open_in_memory().expect("open fixture database");
+    connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    for migration in [
+        INITIAL,
+        TRUST,
+        AUTOMATIC_ISSUANCE,
+        ROOT_DIRECT,
+        CERTIFICATE_DEVELOPER_ID,
+        ONLINE_ISSUANCE,
+        UUID_DEVELOPER_IDS,
+    ] {
+        connection
+            .execute_batch(migration)
+            .expect("apply predecessor migration");
+    }
+    let developer_id = "019f9e5ac6687902b0e72fe53abfbef1";
+    connection.execute("INSERT INTO developers(id,certificate_developer_id,developer_type,display_name,status,verification_status,created_at,updated_at) VALUES(?1,'developer','individual','Fixture','active','pending',1,1)",[developer_id]).unwrap();
+    connection.execute("INSERT INTO certificate_requests(id,developer_id,requested_by_account_id,signature_algorithm,subject_public_key,subject_key_id,package_id_scopes_json,allowed_capabilities_json,status,created_at,updated_at) VALUES('request',?1,'account','ed25519','public','subject','[]','[]','issued',1,1)",[developer_id]).unwrap();
+    connection.execute("INSERT INTO certificates(id,certificate_request_id,developer_id,serial_number,issuer_key_id,subject_key_id,certificate_json,not_before,not_after,status,created_at,issuance_source) VALUES('certificate','request',?1,'1','issuer','subject','wire',1,2,'active',1,'online_intermediate')",[developer_id]).unwrap();
+
+    connection
+        .execute_batch(AUTOMATIC_DEVELOPER_VERIFICATION)
+        .expect("verify existing developer");
+    connection
+        .execute_batch(CERTIFICATE_SUSPENSIONS)
+        .expect("add certificate suspensions");
+    connection.execute("INSERT INTO certificate_suspensions(certificate_id,suspended_by_account_id,reason,suspended_at) VALUES('certificate','admin','incident',2)",[]).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT verification_status FROM developers WHERE id=?1",
+                [developer_id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "verified"
+    );
+    connection
+        .execute(
+            "DELETE FROM certificate_suspensions WHERE certificate_id='certificate'",
+            [],
+        )
+        .expect("restore certificate");
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM certificate_suspensions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+}
 
 fn existing_database() -> Connection {
     let connection = Connection::open_in_memory().expect("open fixture database");

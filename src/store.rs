@@ -313,16 +313,23 @@ pub async fn update_verification(
     developer(db, developer_id).await
 }
 
-pub async fn suspend_developer(
+pub async fn set_developer_suspension(
     db: &D1Database,
     developer_id: &str,
+    suspended: bool,
     actor: &str,
     now: i64,
 ) -> Result<Option<Developer>> {
+    let status = if suspended { "suspended" } else { "active" };
+    let event = if suspended {
+        "developer.suspended"
+    } else {
+        "developer.restored"
+    };
     db.batch(vec![
-        db.prepare("UPDATE developers SET status='suspended', updated_at=?1 WHERE id=?2 AND status='active'")
-            .bind(&[number(now), value(developer_id)])?,
-        audit(db, Some(developer_id), Some(actor), "developer.suspended", now)?,
+        db.prepare("UPDATE developers SET status=?1, updated_at=?2 WHERE id=?3 AND status IN ('active','suspended')")
+            .bind(&[value(status), number(now), value(developer_id)])?,
+        audit(db, Some(developer_id), Some(actor), event, now)?,
     ]).await?;
     developer(db, developer_id).await
 }
@@ -599,28 +606,81 @@ pub async fn issue_certificate(
 
 pub async fn certificate(db: &D1Database, certificate_id: &str) -> Result<Option<CertificateRow>> {
     db.prepare(
-        "SELECT id, certificate_request_id, developer_id, serial_number, issuer_key_id, subject_key_id,
-         certificate_json, not_before, not_after, status, created_at, issuance_source,
-         issued_by_account_id FROM certificates WHERE id=?1",
+        "SELECT c.id, c.certificate_request_id, c.developer_id, c.serial_number, c.issuer_key_id, c.subject_key_id,
+         c.certificate_json, c.not_before, c.not_after,
+         CASE WHEN c.status='revoked' THEN 'revoked' WHEN s.certificate_id IS NOT NULL THEN 'suspended' ELSE c.status END AS status,
+         c.created_at, c.issuance_source, c.issued_by_account_id
+         FROM certificates c LEFT JOIN certificate_suspensions s ON s.certificate_id=c.id
+         WHERE c.id=?1",
     ).bind(&[value(certificate_id)])?.first(None).await
 }
 
 pub async fn list_certificates(db: &D1Database, developer_id: &str) -> Result<Vec<CertificateRow>> {
     all(db.prepare(
-        "SELECT id, certificate_request_id, developer_id, serial_number, issuer_key_id, subject_key_id,
-         certificate_json, not_before, not_after, status, created_at, issuance_source,
-         issued_by_account_id FROM certificates WHERE developer_id=?1 ORDER BY created_at DESC",
+        "SELECT c.id, c.certificate_request_id, c.developer_id, c.serial_number, c.issuer_key_id, c.subject_key_id,
+         c.certificate_json, c.not_before, c.not_after,
+         CASE WHEN c.status='revoked' THEN 'revoked' WHEN s.certificate_id IS NOT NULL THEN 'suspended' ELSE c.status END AS status,
+         c.created_at, c.issuance_source, c.issued_by_account_id
+         FROM certificates c LEFT JOIN certificate_suspensions s ON s.certificate_id=c.id
+         WHERE c.developer_id=?1 ORDER BY c.created_at DESC",
     ).bind(&[value(developer_id)])?).await
 }
 
 pub async fn active_certificates(db: &D1Database) -> Result<Vec<CertificateRow>> {
     all(db.prepare(
-        "SELECT id, certificate_request_id, developer_id, serial_number, issuer_key_id, subject_key_id,
-         certificate_json, not_before, not_after, status, created_at, issuance_source,
-         issued_by_account_id FROM certificates
-         WHERE status='active' ORDER BY created_at DESC LIMIT 100",
+        "SELECT c.id, c.certificate_request_id, c.developer_id, c.serial_number, c.issuer_key_id, c.subject_key_id,
+         c.certificate_json, c.not_before, c.not_after,
+         CASE WHEN c.status='revoked' THEN 'revoked' WHEN s.certificate_id IS NOT NULL THEN 'suspended' ELSE c.status END AS status,
+         c.created_at, c.issuance_source, c.issued_by_account_id
+         FROM certificates c LEFT JOIN certificate_suspensions s ON s.certificate_id=c.id
+         WHERE c.status='active' ORDER BY c.created_at DESC LIMIT 100",
     ))
     .await
+}
+
+pub async fn set_certificate_suspension(
+    db: &D1Database,
+    certificate_id: &str,
+    suspended: bool,
+    actor: &str,
+    reason: Option<&str>,
+    now: i64,
+) -> Result<Option<CertificateRow>> {
+    let Some(current) = certificate(db, certificate_id).await? else {
+        return Ok(None);
+    };
+    if current.status == "revoked" {
+        return Ok(Some(current));
+    }
+    let mutation = if suspended {
+        db.prepare(
+            "INSERT INTO certificate_suspensions
+             (certificate_id, suspended_by_account_id, reason, suspended_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(certificate_id) DO UPDATE SET suspended_by_account_id=excluded.suspended_by_account_id,
+             reason=excluded.reason, suspended_at=excluded.suspended_at",
+        )
+        .bind(&[
+            value(certificate_id),
+            value(actor),
+            value(reason.unwrap_or("administrative")),
+            number(now),
+        ])?
+    } else {
+        db.prepare("DELETE FROM certificate_suspensions WHERE certificate_id=?1")
+            .bind(&[value(certificate_id)])?
+    };
+    let event = if suspended {
+        "certificate.suspended"
+    } else {
+        "certificate.restored"
+    };
+    db.batch(vec![
+        mutation,
+        audit(db, Some(&current.developer_id), Some(actor), event, now)?,
+    ])
+    .await?;
+    certificate(db, certificate_id).await
 }
 
 pub struct RevocationSnapshotRecord<'a> {
@@ -646,6 +706,8 @@ pub async fn revoke_certificate(
     };
     db.batch(vec![
         db.prepare("UPDATE certificates SET status='revoked' WHERE id=?1 AND status='active'")
+            .bind(&[value(certificate_id)])?,
+        db.prepare("DELETE FROM certificate_suspensions WHERE certificate_id=?1")
             .bind(&[value(certificate_id)])?,
         db.prepare(
             "INSERT INTO revocations

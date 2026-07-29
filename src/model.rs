@@ -83,6 +83,12 @@ pub struct VerificationInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct SuspensionInput {
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RevokeInput {
     pub reason: String,
     pub reason_code: Option<mochios_developer_ca_trust::RevocationReasonCode>,
