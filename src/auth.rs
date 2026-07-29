@@ -1,4 +1,7 @@
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use mochios_developer_ca_auth_token::{Claims, TOKEN_PREFIX, verify};
 use serde::Deserialize;
 use worker::{Fetch, Headers, Method, Request, RequestInit, Result, wasm_bindgen::JsValue};
@@ -32,6 +35,19 @@ pub struct AdminActor {
     pub account_id: String,
     pub jti: String,
     pub expires_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CliActor {
+    pub account_id: String,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CliSessionIntrospection {
+    active: bool,
+    account_id: String,
+    session_id: String,
 }
 
 fn service_headers(env: &worker::Env) -> Result<Headers> {
@@ -147,6 +163,79 @@ pub async fn admin(req: &Request, env: &worker::Env) -> Result<Option<AdminActor
     )
 }
 
+pub async fn cli(req: &Request, env: &worker::Env) -> Result<Option<CliActor>> {
+    let authorization = req.headers().get("Authorization")?.unwrap_or_default();
+    let Some(token) = authorization.strip_prefix("Bearer ").map(str::trim) else {
+        return Ok(None);
+    };
+    let encoded = env.secret("ACCOUNTS_CLI_TOKEN_PUBLIC_KEY")?.to_string();
+    let bytes = URL_SAFE_NO_PAD
+        .decode(&encoded)
+        .or_else(|_| STANDARD.decode(&encoded))
+        .map_err(|_| worker::Error::RustError("invalid Accounts CLI token public key".into()))?;
+    let public_key: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| worker::Error::RustError("invalid Accounts CLI token public key".into()))?;
+    let timestamp = worker::Date::now().as_millis() / 1000;
+    let claims = match verify(token, &public_key, timestamp) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let Some(session_id) = claims.session_id.clone() else {
+        return Ok(None);
+    };
+    let Some(scope) = claims.scope.clone() else {
+        return Ok(None);
+    };
+    if !cli_claims_match(&claims) {
+        return Ok(None);
+    }
+    let scopes: Vec<String> = scope.split(' ').map(str::to_owned).collect();
+    let base = env.var("ACCOUNTS_BASE_URL")?.to_string();
+    let headers = service_headers(env)?;
+    headers.set("Content-Type", "application/json")?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(JsValue::from_str(
+            &serde_json::json!({"account_id":claims.sub,"session_id":session_id}).to_string(),
+        )));
+    let request = Request::new_with_init(
+        &format!(
+            "{}/v1/internal/cli/sessions/introspect",
+            base.trim_end_matches('/')
+        ),
+        &init,
+    )?;
+    let mut response = match Fetch::Request(request).send().await {
+        Ok(value) if value.status_code() == 200 => value,
+        _ => return Ok(None),
+    };
+    let state: CliSessionIntrospection = match response.json().await {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    if !state.active || state.account_id != claims.sub || state.session_id != session_id {
+        return Ok(None);
+    }
+    Ok(Some(CliActor {
+        account_id: claims.sub,
+        scopes,
+    }))
+}
+
+fn cli_claims_match(claims: &Claims) -> bool {
+    claims.iss == "accounts.mochios.org"
+        && claims.aud == "developer-ca"
+        && claims.role == "cli"
+        && claims.act.as_deref() == Some("kome-cli")
+        && claims.client_id.as_deref() == Some("kome-cli")
+        && claims
+            .session_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +250,9 @@ mod tests {
             jti: "fixture".into(),
             role: "developer_ca_reviewer".into(),
             act: Some("mochios-console".into()),
+            client_id: None,
+            scope: None,
+            session_id: None,
         }
     }
 
@@ -227,5 +319,20 @@ mod tests {
         ] {
             assert_eq!(active_introspection_account(result), None);
         }
+    }
+
+    #[test]
+    fn cli_claims_require_accounts_audience_client_and_session() {
+        let mut value = claims();
+        value.iss = "accounts.mochios.org".into();
+        value.aud = "developer-ca".into();
+        value.role = "cli".into();
+        value.act = Some("kome-cli".into());
+        value.client_id = Some("kome-cli".into());
+        value.scope = Some("certificate.issue".into());
+        value.session_id = Some("session-1".into());
+        assert!(cli_claims_match(&value));
+        value.aud = "developer-ca-admin".into();
+        assert!(!cli_claims_match(&value));
     }
 }

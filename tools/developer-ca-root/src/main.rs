@@ -284,6 +284,9 @@ fn issue_admin_token(
             jti,
             role: "developer_ca_reviewer".into(),
             act: Some("mochios-console".into()),
+            client_id: None,
+            scope: None,
+            session_id: None,
         },
         &signing_key,
     )

@@ -6,7 +6,7 @@ pub const TOKEN_PREFIX: &str = "mca1";
 pub const DOMAIN_SEPARATOR: &[u8] = b"mochios-developer-ca-delegation-v1\0";
 pub const MAX_TOKEN_BYTES: usize = 4096;
 pub const MAX_PAYLOAD_BYTES: usize = 2048;
-pub const MAX_TOKEN_LIFETIME_SECONDS: u64 = 120;
+pub const MAX_TOKEN_LIFETIME_SECONDS: u64 = 900;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +20,12 @@ pub struct Claims {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub act: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,6 +119,18 @@ fn validate_claims(claims: &Claims, now: u64) -> Result<(), TokenError> {
             .act
             .as_deref()
             .is_some_and(|value| !valid_text(value, 128))
+        || claims
+            .client_id
+            .as_deref()
+            .is_some_and(|value| !valid_text(value, 64))
+        || claims
+            .scope
+            .as_deref()
+            .is_some_and(|value| value.is_empty() || value.len() > 512)
+        || claims
+            .session_id
+            .as_deref()
+            .is_some_and(|value| !valid_text(value, 128))
         || claims.iat >= claims.exp
     {
         return Err(TokenError::InvalidClaims);
@@ -158,6 +176,9 @@ mod tests {
             jti: "test-jti-1".into(),
             role: "developer_ca_reviewer".into(),
             act: Some("mochios-console".into()),
+            client_id: None,
+            scope: None,
+            session_id: None,
         }
     }
 
