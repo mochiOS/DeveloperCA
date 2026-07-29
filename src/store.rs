@@ -154,7 +154,7 @@ pub async fn create_developer(
     db.batch(vec![
         db.prepare(
             "INSERT INTO developers (id, certificate_developer_id, developer_type, display_name, status, verification_status, created_at, updated_at)
-             SELECT ?1, ?2, ?3, ?4, 'active', 'pending', ?5, ?5
+             SELECT ?1, ?2, ?3, ?4, 'active', 'verified', ?5, ?5
              WHERE NOT EXISTS (
                SELECT 1 FROM developer_members m JOIN developers d ON d.id=m.developer_id
                WHERE m.account_id=?6 AND m.role='owner' AND m.status='active' AND d.status='active'

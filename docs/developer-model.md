@@ -4,4 +4,6 @@ AccountはAccountsが管理する人間の認証主体です。Developerは公�
 
 Developer MemberがAccountとDeveloperを結びます。roleはowner、admin、developer、viewer、状態はactive、invited、suspended、removedです。Certificate発行はactiveなowner／admin／developerだけに許可し、viewerは発行できません。
 
+Developerは作成時に自動で`verified`になります。事前審査は行わず、不正利用やポリシー違反が判明した場合は管理者がDeveloperを停止します。
+
 Developer IDは公開情報であり、所有証明やcredentialとして扱いません。作成者のowner membershipはDeveloperと同じD1 batchで作成し、triggerにより最後のactive ownerを削除できません。
