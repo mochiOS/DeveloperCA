@@ -33,7 +33,13 @@ cargo run --release --manifest-path tools/developer-ca-root/Cargo.toml -- trust-
 cargo run --release --manifest-path tools/developer-ca-root/Cargo.toml -- trust-snapshot verify --snapshot trust-snapshot.json --root-public-record root-public.json --at <unix>
 ```
 
-`intermediate.seed`だけを`INTERMEDIATE_PRIVATE_KEY`へ登録し、`root.seed`はオフラインへ戻します。Trust Snapshotは短期署名済みDeveloper CA admin tokenで`POST /v1/admin/trust-snapshots`へJSON本体のまま登録します。tokenのactorはactive Accountでなければならず、jtiは一度だけ使用できます。
+`intermediate.seed`だけを`INTERMEDIATE_PRIVATE_KEY`へ登録し、`root.seed`はオフラインへ戻します。Trust Snapshotは短期署名済みDeveloper CA admin tokenで`POST /v1/admin/trust-snapshots`へJSON本体のまま登録します。管理トークンは`CONSOLE_TOKEN_PUBLIC_KEY`に対応する専用のConsole delegation署名鍵で発行し、Offline Root鍵では署名しません。
+
+```powershell
+cargo run --release --manifest-path tools/developer-ca-root/Cargo.toml -- admin-token issue --signing-key console-token.seed --subject <active-account-uuid> --issued-at <unix> --expires-at <unix-within-120-seconds> --output admin-token.txt
+```
+
+tokenのactorはactive Accountでなければならず、寿命は最大120秒、jtiは一度だけ使用できます。登録後は`admin-token.txt`を削除します。`root.seed`が署名するのはTrust Snapshotそのものであり、オンラインAPI認証には使用しません。
 
 ## 反映確認
 
