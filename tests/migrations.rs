@@ -90,6 +90,7 @@ fn developer_id_migration_rewrites_primary_and_foreign_keys() {
     let old = "019f9e5a-c668-7902-b0e7-2fe53abfbef1";
     connection.execute("INSERT INTO developers(id,certificate_developer_id,developer_type,display_name,status,verification_status,created_at,updated_at) VALUES(?1,'legacy','individual','Fixture','active','verified',1,1)",[old]).unwrap();
     connection.execute("INSERT INTO developer_members(id,developer_id,account_id,role,status,created_at,updated_at) VALUES('member',?1,'account','owner','active',1,1)",[old]).unwrap();
+    connection.execute("INSERT INTO audit_logs(id,developer_id,actor_account_id,event_type,metadata_json,created_at) VALUES('audit',?1,'account','fixture','{}',1)",[old]).unwrap();
     connection.execute_batch("BEGIN;").unwrap();
     connection
         .execute_batch(UUID_DEVELOPER_IDS)
@@ -110,6 +111,20 @@ fn developer_id_migration_rewrites_primary_and_foreign_keys() {
             })
             .unwrap(),
         expected
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT developer_id FROM audit_logs", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        expected
+    );
+    assert!(
+        connection
+            .execute("UPDATE audit_logs SET event_type='changed'", [])
+            .is_err(),
+        "append-only update guard must be restored"
     );
     assert_eq!(
         connection
