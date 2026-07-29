@@ -1,14 +1,15 @@
 # 運用
 
-一般開発者は`msign key generate`で`application.key`と`application.pub`を作り、Consoleで公開鍵とunsigned MPKGを選択して`developer.cert`を取得します。その後、開発者端末で次を実行します。
+一般開発者の操作はdevkitへ集約します。
 
 ```powershell
-msign package sign application.mpkg --certificate developer.cert --key application.key --output application-signed.mpkg
-msign package verify application-signed.mpkg --root-public-key <trusted-key> --unix-time <unix>
+kome login
+kome keygen
+kome sign
 ```
 
-`kome sign`はlegacy `.pkg`用です。MPKGのDeveloper Certificate付き署名には`msign package sign`を使用します。
+`kome sign`はローカルMPKGのmanifestからPackage IDと全`binary.requires`の和集合を読み、公開鍵とそのmetadataだけをDeveloperCAへ送ります。返されたMCERをMPKGへ組み込み、秘密鍵で`manifest.sig`を生成します。秘密鍵とMPKG本体はCloudへ送信しません。
 
-運営者はOffline Root、Trust Snapshot、Issuerローテーションを管理します。一般発行へRoot秘密鍵を使いません。Issuerローテーションは新IssuerをfutureとしてSnapshotへ追加し、新しいSnapshotでactiveを切り替え、旧Issuerをretired、侵害時はrevokedへ単調に遷移させます。
+運営者はDeveloper確認、Certificate失効、Offline Root、Issuerローテーションを管理します。Certificate発行の人手審査はありません。AppStoreは登録、Reviewer報告、公開承認の各段階でstatusを再確認します。
 
-Certificate失効はConsole管理画面からreason codeと説明を付けて行います。失効serialは再利用しません。AppStoreは登録、Reviewer報告、公開承認の各段階でDeveloper CA statusを確認します。
+開発中の環境ではTrust Snapshotを未登録のままにできます。その場合、一般発行は503でfail closedします。

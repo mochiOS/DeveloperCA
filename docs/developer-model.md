@@ -1,15 +1,7 @@
 # Developerモデル
 
-AccountはAccountsが管理する人間の認証主体です。Developerは公開者・署名主体、
-Developer MemberはAccountとDeveloperの所属関係です。
+AccountはAccountsが管理する人間の認証主体です。Developerは公開者・署名主体で、32桁小文字UUIDv7本体を公開Developer IDとして使います。両者は別の識別子型です。
 
-roleはowner、admin、developer、viewer、membership状態はactive、invited、
-suspended、removedです。Developerの利用状態と審査状態は別々の列へ保存します。
+Developer MemberがAccountとDeveloperを結びます。roleはowner、admin、developer、viewer、状態はactive、invited、suspended、removedです。Certificate発行はactiveなowner／admin／developerだけに許可し、viewerは発行できません。
 
-Developer作成と作成者のowner membershipは同じD1 batchで作成します。DB trigger
-により最後のactive ownerを削除できません。
-
-Accountが通常所有できるactive Developerは1つです。2つ目以降は、申請内容と
-一致するapprovedかつ未使用の追加作成申請が必要で、作成時に同じtransactionで
-consumedへ変更します。他Developerへのmember参加数は所有数へ含めません。
-
+Developer IDは公開情報であり、所有証明やcredentialとして扱いません。作成者のowner membershipはDeveloperと同じD1 batchで作成し、triggerにより最後のactive ownerを削除できません。

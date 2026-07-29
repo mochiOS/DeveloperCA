@@ -1,55 +1,25 @@
 # mochiOS Developer CA
 
-一般開発者へDeveloper Certificate（MCER v1）を発行し、Developer、Member、証明書、Issuer trust、失効状態を管理するRust／`workers-rs`製Cloudflare Workerです。状態はD1へ保存します。
+Developer、Member、Developer Certificate（MCER v1）、Issuer trust、失効状態の正本となるRust／`workers-rs`製Cloudflare Workerです。
 
-通常発行はOnline Intermediateを使用します。Offline Root秘密鍵はCloudへ置かず、Root署名済みTrust Snapshotだけを登録します。
-
-```text
-Offline Root
-  └─ Root署名済みTrust Snapshot
-       └─ Online Intermediate
-            └─ developer.cert（MCER v1）
-```
-
-開発者はConsoleで`application.pub`とunsigned `.mpkg`を選択します。MPKGはブラウザ内だけで解析され、APIへ届くのは公開鍵、完全一致Package ID、Capability集合だけです。Developerがactiveかつverifiedで、呼出Accountがactiveなowner／admin／developer Memberなら、人によるCertificate審査なしで即時発行します。viewerは一覧と再取得だけ可能です。
-
-## API
+一般発行はKome CLI専用です。Accountsが発行した短寿命Bearer tokenの署名、issuer、`developer-ca` audience、`kome-cli` client、scope、期限、session IDを検証し、Accounts introspectionでAccountと端末sessionが現在もactiveか確認します。さらに発行直前にDeveloperとactive membership、owner／admin／developer roleをD1から再確認します。
 
 ```text
+GET  /v1/cli/developers
 POST /v1/developers/:developer_id/certificates/issue
 GET  /v1/developers/:developer_id/certificates
 GET  /v1/certificates/:certificate_id
 GET  /v1/certificates/:certificate_id/status
-GET  /v1/trust-store
-GET  /v1/trust-store/:snapshot_version
-GET  /v1/revocations
-GET  /v1/revocations/:snapshot_version
-POST /v1/admin/trust-snapshots
-POST /v1/admin/certificates/:certificate_id/revoke
 ```
 
-発行入力:
+Developer IDは32桁小文字UUIDv7本体です。Package IDは`org.mochios.*`に限定せず、2 segment以上の小文字reverse-domain形式を共有`mochios-certificate` validatorで検証します。一般APIが発行するscopeは完全一致1件だけです。
 
-```json
-{
-  "subject_public_key": "<Base64または64桁hexのEd25519公開鍵>",
-  "package_id": "org.mochios.example",
-  "capabilities": ["fs.read.all", "window.create"]
-}
-```
-
-`X-Idempotency-Key`が必須です。成功応答の`certificate`がBase64のraw MCER bytesです。秘密鍵やMPKGを受理するfieldはありません。
-
-## ローカル確認
+発行APIが受け取るのはDeveloper公開鍵、Package ID、Capability集合だけです。Developer秘密鍵、MPKG、payload、ローカルpath、refresh tokenは受け取りません。成功時の`certificate`はBase64 MCER wire bytesです。
 
 ```powershell
-rustup target add wasm32-unknown-unknown
-cargo install worker-build
 npx wrangler d1 migrations apply mochios-developer-ca --local
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo check --target wasm32-unknown-unknown
 npx wrangler dev
 ```
-
-Secret、Trust Snapshot登録、本番反映は[docs/deployment.md](docs/deployment.md)を参照してください。証明書発行の詳細は[docs/certificate-format.md](docs/certificate-format.md)、全体フローは[docs/architecture.md](docs/architecture.md)にあります。

@@ -3,7 +3,8 @@
 - Developer秘密鍵とMPKGを受け取らない
 - Offline Root秘密鍵をCloud、D1、CI、通常の開発端末へ置かない
 - WorkerのOnline Intermediate秘密鍵をSecret以外へ保存・出力しない
-- Accounts sessionまたは署名済みConsole delegationのactorだけを使用する
+- 一般発行はAccounts署名のKome CLI tokenだけを使用し、issuer、audience、client、scope、期限、session状態を検証する
+- Web CookieやDeveloper IDだけでは一般発行を許可しない
 - active Account、Developer、Member roleを発行時に再検証する
 - Root署名Trust Snapshot、Issuer Registry、Worker秘密鍵の公開鍵を毎回照合する
 - active Issuerが0件、複数、不一致、期限外、revokedならfail closedにする

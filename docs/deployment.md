@@ -4,6 +4,7 @@
 
 ```text
 SERVICE_TOKEN                 Accounts内部APIと同じランダムtoken
+ACCOUNTS_CLI_TOKEN_PUBLIC_KEY AccountsのCLI署名鍵に対応するBase64URL Ed25519公開鍵
 CONSOLE_TOKEN_PUBLIC_KEY      Console delegation署名鍵に対応するBase64 Ed25519公開鍵
 INTERMEDIATE_PRIVATE_KEY      Online IntermediateのBase64 Ed25519 32-byte seed
 OFFLINE_ROOT_PUBLIC_KEY       Offline RootのBase64 Ed25519 32-byte公開鍵
@@ -14,6 +15,7 @@ OFFLINE_ROOT_KEY_ID           Offline Root公開鍵bytesのSHA-256 lowercase hex
 
 ```powershell
 npx wrangler secret put SERVICE_TOKEN
+npx wrangler secret put ACCOUNTS_CLI_TOKEN_PUBLIC_KEY
 npx wrangler secret put CONSOLE_TOKEN_PUBLIC_KEY
 npx wrangler secret put INTERMEDIATE_PRIVATE_KEY
 npx wrangler secret put OFFLINE_ROOT_PUBLIC_KEY
