@@ -2,7 +2,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use mochios_certificate::{
     DeveloperCertificate, KEY_USAGE_PACKAGE_SIGNING, PackageIdScope, PackageScopeKind,
-    SIGNATURE_LEN, is_valid_capability, key_id,
+    SIGNATURE_LEN, is_valid_capability, is_valid_package_id, key_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -37,6 +37,9 @@ pub struct CertificateRequestInput {
 
 impl CertificateIssueInput {
     pub fn into_request(mut self) -> Result<CertificateRequestInput, String> {
+        if !is_valid_package_id(&self.package_id) {
+            return Err("invalid package id".into());
+        }
         self.capabilities.sort();
         let request = CertificateRequestInput {
             signature_algorithm: SIGNATURE_ALGORITHM.into(),
@@ -244,7 +247,7 @@ fn parse_scopes(scopes: &[String]) -> Result<Vec<PackageIdScope>, String> {
     let probe = DeveloperCertificate {
         serial_number: 1,
         issuer_key_id: [1; 32],
-        developer_id: "developer".into(),
+        developer_id: "019f9e5ac6687902b0e72fe53abfbef1".into(),
         subject_key_id: key_id(&subject_key),
         subject_public_key: subject_key,
         not_before: 1,
@@ -295,7 +298,7 @@ mod tests {
         let wire = issue(
             IssueCertificate {
                 serial_number: 7,
-                developer_id: "018f0000-0000-7000-8000-000000000001",
+                developer_id: "019f9e5ac6687902b0e72fe53abfbef1",
                 not_before: 100,
                 not_after: 200,
                 request: &request(),

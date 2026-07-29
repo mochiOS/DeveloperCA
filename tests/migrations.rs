@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 const INITIAL: &str = include_str!("../migrations/0001_developer_ca.sql");
 const TRUST: &str = include_str!("../migrations/0002_trust_issuers_policy.sql");
@@ -8,6 +8,7 @@ const ROOT_DIRECT: &str = include_str!("../migrations/0004_root_direct_trust.sql
 const CERTIFICATE_DEVELOPER_ID: &str =
     include_str!("../migrations/0005_certificate_developer_id.sql");
 const ONLINE_ISSUANCE: &str = include_str!("../migrations/0006_online_certificate_issuance.sql");
+const UUID_DEVELOPER_IDS: &str = include_str!("../migrations/0007_uuid_developer_ids.sql");
 
 fn existing_database() -> Connection {
     let connection = Connection::open_in_memory().expect("open fixture database");
@@ -68,6 +69,66 @@ fn existing_database() -> Connection {
         )
         .expect("insert audit");
     connection
+}
+
+#[test]
+fn developer_id_migration_rewrites_primary_and_foreign_keys() {
+    let connection = Connection::open_in_memory().expect("open fixture database");
+    connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    for migration in [
+        INITIAL,
+        TRUST,
+        AUTOMATIC_ISSUANCE,
+        ROOT_DIRECT,
+        CERTIFICATE_DEVELOPER_ID,
+        ONLINE_ISSUANCE,
+    ] {
+        connection
+            .execute_batch(migration)
+            .expect("apply predecessor migration");
+    }
+    let old = "019f9e5a-c668-7902-b0e7-2fe53abfbef1";
+    connection.execute("INSERT INTO developers(id,certificate_developer_id,developer_type,display_name,status,verification_status,created_at,updated_at) VALUES(?1,'legacy','individual','Fixture','active','verified',1,1)",[old]).unwrap();
+    connection.execute("INSERT INTO developer_members(id,developer_id,account_id,role,status,created_at,updated_at) VALUES('member',?1,'account','owner','active',1,1)",[old]).unwrap();
+    connection.execute_batch("BEGIN;").unwrap();
+    connection
+        .execute_batch(UUID_DEVELOPER_IDS)
+        .expect("apply UUID migration");
+    connection.execute_batch("COMMIT;").unwrap();
+    let expected = "019f9e5ac6687902b0e72fe53abfbef1";
+    assert_eq!(
+        connection
+            .query_row("SELECT id FROM developers", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT developer_id FROM developer_members", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT certificate_developer_id FROM developers",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        connection
+            .query_row("PRAGMA foreign_key_check", [], |row| row
+                .get::<_, String>(0))
+            .optional()
+            .unwrap(),
+        None
+    );
 }
 
 #[test]

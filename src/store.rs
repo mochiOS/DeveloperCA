@@ -22,6 +22,10 @@ pub fn id(now: i64) -> String {
     Uuid::new_v7(timestamp).to_string()
 }
 
+fn developer_id(now: i64) -> String {
+    id(now).replace('-', "")
+}
+
 fn audit(
     db: &D1Database,
     developer_id: Option<&str>,
@@ -144,9 +148,8 @@ pub async fn create_developer(
     request_id: Option<&str>,
     now: i64,
 ) -> Result<Option<Developer>> {
-    let developer_id = id(now);
-    let certificate_developer_id =
-        format!("org.mochios.developer.{}", developer_id.replace('-', ""));
+    let developer_id = developer_id(now);
+    let certificate_developer_id = developer_id.clone();
     let request = nullable(request_id);
     db.batch(vec![
         db.prepare(

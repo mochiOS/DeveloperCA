@@ -62,7 +62,7 @@ fn online_intermediate_mcer_and_revocation_round_trip() {
     let wire = issue(
         IssueCertificate {
             serial_number: 42,
-            developer_id: "org.mochios.developer.example",
+            developer_id: "019f9e5ac6687902b0e72fe53abfbef1",
             not_before: 1_100,
             not_after: 1_900,
             request: &request,
@@ -83,7 +83,7 @@ fn online_intermediate_mcer_and_revocation_round_trip() {
         certificate_key_id(&subject_public_key)
     );
     assert_eq!(certificate.subject_public_key, subject_public_key);
-    assert_eq!(certificate.developer_id, "org.mochios.developer.example");
+    assert_eq!(certificate.developer_id, "019f9e5ac6687902b0e72fe53abfbef1");
     assert_eq!(certificate.package_id_scopes.len(), 1);
     assert_eq!(
         certificate.package_id_scopes[0].kind,

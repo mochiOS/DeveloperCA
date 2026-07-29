@@ -528,7 +528,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "mochios-certificate"
 version = "0.1.0"
-source = "git+https://github.com/mochiOS/syscalls?rev=ee6be939de4635824df7f50858d66391dd6ead41#ee6be939de4635824df7f50858d66391dd6ead41"
+source = "git+https://github.com/mochiOS/syscalls?rev=af217f5ca6a585110aabac813eb46dff8ccb7bfc#af217f5ca6a585110aabac813eb46dff8ccb7bfc"
 dependencies = [
  "ed25519-dalek",
  "sha2",

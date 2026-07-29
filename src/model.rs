@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Developer {
     pub id: String,
+    #[serde(skip_serializing)]
     pub certificate_developer_id: String,
     pub developer_type: String,
     pub display_name: String,
