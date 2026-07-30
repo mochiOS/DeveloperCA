@@ -37,11 +37,30 @@ cargo run --release --manifest-path tools/developer-ca-root/Cargo.toml -- trust-
 
 `intermediate.seed`だけを`INTERMEDIATE_PRIVATE_KEY`へ登録し、`root.seed`はオフラインへ戻します。Trust Snapshotは短期署名済みDeveloper CA admin tokenで`POST /v1/admin/trust-snapshots`へJSON本体のまま登録します。管理トークンは`CONSOLE_TOKEN_PUBLIC_KEY`に対応する専用のConsole delegation署名鍵で発行し、Offline Root鍵では署名しません。
 
+秘密鍵や公開鍵レコードの場所は固定しません。USBメディアへ移動した後も、すべての操作で引数へ現在のパスを渡します。mochiOS製品ビルドへ組み込むOffline Root公開鍵のhexは、公開鍵レコードから次のように取得できます。
+
+```powershell
+cargo run --quiet --release --manifest-path tools/developer-ca-root/Cargo.toml -- root public-key-hex --public-record "<USB>:\mochios-ca\root-public.json"
+```
+
+出力された64文字のhexを、製品ビルド時だけ`MOCHIOS_DEVELOPER_ROOT_PUBLIC_KEYS_HEX`へ設定します。公開鍵はGitへ書き込まず、Root移行時は旧鍵と新鍵をcomma区切りで指定します。
+
 ```powershell
 cargo run --release --manifest-path tools/developer-ca-root/Cargo.toml -- admin-token issue --signing-key console-token.seed --subject <active-account-uuid> --issued-at <unix> --expires-at <unix-within-120-seconds> --output admin-token.txt
 ```
 
 tokenのactorはactive Accountでなければならず、寿命は最大120秒、jtiは一度だけ使用できます。登録後は`admin-token.txt`を削除します。`root.seed`が署名するのはTrust Snapshotそのものであり、オンラインAPI認証には使用しません。
+
+## Revocation Snapshot
+
+初回デプロイ後、短期管理トークンで空のRevocation Snapshotを生成します。秘密鍵のパスとtoken出力先は引数で渡し、固定しません。
+
+```powershell
+$now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+cargo run --quiet --release --manifest-path tools/developer-ca-root/Cargo.toml -- admin-token issue --signing-key "<USB>:\mochios-ca\console-token.seed" --subject "<active-account-uuid>" --issued-at $now --expires-at ($now + 120) --output "$env:TEMP\developer-ca-admin-token.txt"
+```
+
+生成したtokenを`Authorization: Bearer`として`POST /v1/admin/revocation-snapshots/rebuild`へ送り、使用直後にtokenファイルを削除します。Offline Root秘密鍵はこの処理に使用しません。以後は15分ごとのCron TriggerがSnapshotの残存期間を確認し、30分以下になった場合だけOnline Intermediateで更新します。Snapshotの有効期間は1時間です。
 
 ## 反映確認
 

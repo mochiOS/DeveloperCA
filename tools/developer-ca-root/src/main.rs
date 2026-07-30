@@ -53,6 +53,10 @@ enum RootCommand {
         #[arg(long)]
         public_record: PathBuf,
     },
+    PublicKeyHex {
+        #[arg(long)]
+        public_record: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -162,6 +166,9 @@ fn main() -> Result<()> {
                 private_key,
                 public_record,
             } => create_key(&private_key, Some(&public_record), None)?,
+            RootCommand::PublicKeyHex { public_record } => {
+                println!("{}", encode_hex(&read_public_key(&public_record)?));
+            }
         },
         Command::Issuer { command } => match command {
             IssuerCommand::Create {
@@ -391,12 +398,16 @@ fn read_public_key(path: &Path) -> Result<[u8; 32]> {
         PublicKeyInput::Public(record) => (record.key_id, record.public_key),
         PublicKeyInput::Issuer(record) => (record.issuer_key_id, record.public_key),
     };
-    let key = mochios_developer_ca_trust::decode_public_key(&public_key)
-        .context("invalid public key")?;
+    let key =
+        mochios_developer_ca_trust::decode_public_key(&public_key).context("invalid public key")?;
     if key_id(&key) != expected_key_id {
         bail!("public key ID does not match public key");
     }
     Ok(key)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
@@ -479,6 +490,9 @@ mod tests {
                 .verifying_key()
                 .to_bytes()
         );
+        let root_hex = encode_hex(&read_public_key(&root_public).expect("root public key"));
+        assert_eq!(root_hex.len(), 64);
+        assert!(root_hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
         let output = directory.path().join("trust.json");
         issue_trust_snapshot(&root_key, &[issuer_record], 1, 100, 200, &output)
             .expect("issue snapshot");
