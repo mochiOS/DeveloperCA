@@ -9,6 +9,9 @@ command = "worker-build --release --no-panic-recovery"
 ACCOUNTS_BASE_URL = "https://accounts.mochios.org"
 CERTIFICATE_TTL_SECONDS = "31536000"
 
+[triggers]
+crons = ["*/15 * * * *"]
+
 [[routes]]
 pattern = "ca.mochios.org"
 custom_domain = true

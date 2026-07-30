@@ -20,9 +20,18 @@ const MAX_CERTIFICATE_ISSUE_BODY_BYTES: usize = 16 * 1024;
 const MAX_CERTIFICATE_CAPABILITIES: usize = 512;
 const DEFAULT_CERTIFICATE_TTL_SECONDS: i64 = 31_536_000;
 const MAX_CERTIFICATE_TTL_SECONDS: i64 = 31_536_000;
+const REVOCATION_SNAPSHOT_TTL_SECONDS: u64 = 60 * 60;
+const REVOCATION_SNAPSHOT_REFRESH_WINDOW_SECONDS: i64 = 30 * 60;
+const SCHEDULED_SNAPSHOT_ACTOR: &str = "system:scheduled";
 
 fn now() -> i64 {
     (Date::now().as_millis() / 1000) as i64
+}
+
+fn revocation_snapshot_needs_refresh(expires_at: Option<i64>, current_time: i64) -> bool {
+    expires_at.is_none_or(|expires_at| {
+        expires_at <= current_time.saturating_add(REVOCATION_SNAPSHOT_REFRESH_WINDOW_SECONDS)
+    })
 }
 
 fn json_response<T: Serialize>(value: &T, status: u16) -> Result<Response> {
@@ -1806,7 +1815,7 @@ async fn build_revocation_snapshot(
             format_version: REVOCATION_FORMAT_VERSION,
             snapshot_version: version as u64,
             generated_at,
-            expires_at: generated_at.saturating_add(60 * 60),
+            expires_at: generated_at.saturating_add(REVOCATION_SNAPSHOT_TTL_SECONDS),
             issuer_key_id,
             revocations,
             signature_algorithm: SIGNATURE_ALGORITHM.into(),
@@ -1895,6 +1904,41 @@ async fn admin_rebuild_revocation_snapshot(
         "public, max-age=60, must-revalidate",
     )
     .map(|response| response.with_status(201))
+}
+
+async fn refresh_revocation_snapshot(env: &Env, generated_at: i64) -> Result<bool> {
+    let db = env.d1("DB")?;
+    let current = store::current_revocation_snapshot(&db).await?;
+    if !revocation_snapshot_needs_refresh(
+        current.as_ref().map(|snapshot| snapshot.expires_at),
+        generated_at,
+    ) {
+        return Ok(false);
+    }
+    let generated = match build_revocation_snapshot(env, &db, None, generated_at as u64).await? {
+        Ok(value) => value,
+        Err(value) => {
+            return Err(Error::RustError(format!(
+                "{}: {}",
+                value.code, value.message
+            )));
+        }
+    };
+    store::save_revocation_snapshot(
+        &db,
+        store::RevocationSnapshotRecord {
+            version: generated.snapshot.content.snapshot_version as i64,
+            generated_at: generated.snapshot.content.generated_at as i64,
+            expires_at: generated.snapshot.content.expires_at as i64,
+            issuer_key_id: &generated.snapshot.content.issuer_key_id,
+            snapshot_json: &generated.json,
+            etag: &generated.etag,
+        },
+        SCHEDULED_SNAPSHOT_ACTOR,
+        generated_at,
+    )
+    .await?;
+    Ok(true)
 }
 
 async fn admin_revoke(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -2066,9 +2110,44 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .await
 }
 
+#[event(scheduled)]
+pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    let generated_at = now();
+    match refresh_revocation_snapshot(&env, generated_at).await {
+        Ok(true) => console_log!(
+            "{}",
+            json!({
+                "event": "revocation_snapshot.refreshed",
+                "cron": event.cron(),
+                "generated_at": generated_at
+            })
+        ),
+        Ok(false) => console_log!(
+            "{}",
+            json!({
+                "event": "revocation_snapshot.current",
+                "cron": event.cron(),
+                "generated_at": generated_at
+            })
+        ),
+        Err(error) => console_error!(
+            "{}",
+            json!({
+                "event": "revocation_snapshot.refresh_failed",
+                "cron": event.cron(),
+                "generated_at": generated_at,
+                "error": error.to_string()
+            })
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{certificate_issuance_eligible, etag_matches, valid_certificate_display_name};
+    use super::{
+        REVOCATION_SNAPSHOT_REFRESH_WINDOW_SECONDS, certificate_issuance_eligible, etag_matches,
+        revocation_snapshot_needs_refresh, valid_certificate_display_name,
+    };
 
     #[test]
     fn certificate_display_names_are_required_and_unicode_bounded() {
@@ -2085,6 +2164,29 @@ mod tests {
         assert!(etag_matches("\"other\", W/\"abc\"", "\"abc\""));
         assert!(etag_matches("*", "\"abc\""));
         assert!(!etag_matches("W/\"other\"", "\"abc\""));
+    }
+
+    #[test]
+    fn revocation_snapshot_refreshes_before_expiry() {
+        let current_time = 1_000_000;
+        assert!(revocation_snapshot_needs_refresh(None, current_time));
+        assert!(revocation_snapshot_needs_refresh(
+            Some(current_time + REVOCATION_SNAPSHOT_REFRESH_WINDOW_SECONDS),
+            current_time
+        ));
+        assert!(!revocation_snapshot_needs_refresh(
+            Some(current_time + REVOCATION_SNAPSHOT_REFRESH_WINDOW_SECONDS + 1),
+            current_time
+        ));
+    }
+
+    #[test]
+    fn production_config_refreshes_revocation_snapshots() {
+        let config = include_str!("../wrangler.toml");
+        assert!(config.contains("crons = [\"*/15 * * * *\"]"));
+        let source = include_str!("lib.rs");
+        assert!(source.contains("#[event(scheduled)]"));
+        assert!(source.contains("SCHEDULED_SNAPSHOT_ACTOR"));
     }
 
     #[test]
