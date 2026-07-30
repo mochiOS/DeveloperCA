@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use worker::*;
 
 const STATUS_ORIGIN: &str = "https://status.mochios.org";
+const MAX_METADATA_BODY_BYTES: usize = 4 * 1024;
 const MAX_CERTIFICATE_ISSUE_BODY_BYTES: usize = 16 * 1024;
 const MAX_CERTIFICATE_CAPABILITIES: usize = 512;
 const DEFAULT_CERTIFICATE_TTL_SECONDS: i64 = 31_536_000;
@@ -93,6 +94,10 @@ fn valid_idempotency_key(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn valid_certificate_display_name(value: &str) -> bool {
+    !value.is_empty() && value.chars().count() <= 80
 }
 
 fn certificate_request_hash(
@@ -692,6 +697,7 @@ fn certificate_view(row: CertificateRow, issuer_public_key: &str) -> Result<serd
     Ok(json!({
         "id": row.id,
         "certificate_id": row.id,
+        "display_name": row.display_name,
         "status": row.status,
         "serial_number": certificate.serial_number,
         "developer_id": certificate.developer_id,
@@ -705,6 +711,58 @@ fn certificate_view(row: CertificateRow, issuer_public_key: &str) -> Result<serd
         "certificate_details": certificate::view(&certificate),
         "certificate_wire": row.certificate_json,
     }))
+}
+
+async fn patch_certificate(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let developer_id = param(&ctx, "developer_id");
+    let certificate_id = param(&ctx, "certificate_id");
+    let Some(actor) = membership(&req, &ctx, developer_id).await? else {
+        return error("FORBIDDEN", "Active membership required", 403);
+    };
+    if !can_request_certificate(&actor.role) {
+        return error("FORBIDDEN", "Role cannot manage certificates", 403);
+    }
+    if req
+        .headers()
+        .get("Content-Length")?
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > MAX_METADATA_BODY_BYTES)
+    {
+        return error("REQUEST_TOO_LARGE", "Request body is too large", 413);
+    }
+    let bytes = req.bytes().await?;
+    if bytes.len() > MAX_METADATA_BODY_BYTES {
+        return error("REQUEST_TOO_LARGE", "Request body is too large", 413);
+    }
+    let input: UpdateCertificate = match serde_json::from_slice(&bytes) {
+        Ok(input) => input,
+        Err(_) => return error("JSON_INVALID", "JSON request is invalid", 400),
+    };
+    let display_name = input.display_name.trim();
+    if !valid_certificate_display_name(display_name) {
+        return error(
+            "CERTIFICATE_DISPLAY_NAME_INVALID",
+            "Certificate display name must contain 1 to 80 characters",
+            422,
+        );
+    }
+    match store::update_certificate_display_name(
+        &ctx.env.d1("DB")?,
+        developer_id,
+        certificate_id,
+        display_name,
+        &actor.account_id,
+        now(),
+    )
+    .await?
+    {
+        Some(row) => {
+            let db = ctx.env.d1("DB")?;
+            let issuer_public_key = certificate_issuer_public_key(&ctx.env, &db, &row).await?;
+            json_response(&certificate_view(row, &issuer_public_key)?, 200)
+        }
+        None => error("CERTIFICATE_NOT_FOUND", "Certificate not found", 404),
+    }
 }
 
 async fn get_certificate(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -1945,6 +2003,10 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             "/v1/developers/:developer_id/certificates",
             list_certificates,
         )
+        .patch_async(
+            "/v1/developers/:developer_id/certificates/:certificate_id",
+            patch_certificate,
+        )
         .get_async("/v1/certificates/:certificate_id", get_certificate)
         .get_async("/v1/trust-store", trust_store)
         .get_async("/v1/trust-store/:snapshot_version", trust_store_version)
@@ -2006,7 +2068,15 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
 #[cfg(test)]
 mod tests {
-    use super::{certificate_issuance_eligible, etag_matches};
+    use super::{certificate_issuance_eligible, etag_matches, valid_certificate_display_name};
+
+    #[test]
+    fn certificate_display_names_are_required_and_unicode_bounded() {
+        assert!(valid_certificate_display_name("Release signing"));
+        assert!(valid_certificate_display_name(&"証".repeat(80)));
+        assert!(!valid_certificate_display_name(""));
+        assert!(!valid_certificate_display_name(&"証".repeat(81)));
+    }
 
     #[test]
     fn snapshot_etag_accepts_cloudflare_weak_and_list_validators() {
@@ -2060,6 +2130,7 @@ mod tests {
         let production = source.split("#[cfg(test)]").next().unwrap_or_default();
         let store = include_str!("store.rs");
         assert!(production.contains("/v1/developers/:developer_id/certificates/issue"));
+        assert!(production.contains("/v1/developers/:developer_id/certificates/:certificate_id"));
         assert!(production.contains(".get_async(\"/v1/admin/review-queue\", admin_review_queue)"));
         assert!(production.contains("require_admin(&req, &ctx.env)"));
         assert!(production.contains("active_certificates(&db)"));

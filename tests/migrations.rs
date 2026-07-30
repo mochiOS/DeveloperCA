@@ -13,6 +13,61 @@ const AUTOMATIC_DEVELOPER_VERIFICATION: &str =
     include_str!("../migrations/0008_automatic_developer_verification.sql");
 const CERTIFICATE_SUSPENSIONS: &str =
     include_str!("../migrations/0009_certificate_suspensions.sql");
+const CERTIFICATE_DISPLAY_NAMES: &str =
+    include_str!("../migrations/0010_certificate_display_names.sql");
+
+#[test]
+fn certificate_display_names_are_optional_for_existing_rows_and_bounded() {
+    let connection = Connection::open_in_memory().expect("open fixture database");
+    connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    for migration in [
+        INITIAL,
+        TRUST,
+        AUTOMATIC_ISSUANCE,
+        ROOT_DIRECT,
+        CERTIFICATE_DEVELOPER_ID,
+        ONLINE_ISSUANCE,
+        UUID_DEVELOPER_IDS,
+        AUTOMATIC_DEVELOPER_VERIFICATION,
+        CERTIFICATE_SUSPENSIONS,
+    ] {
+        connection
+            .execute_batch(migration)
+            .expect("apply predecessor migration");
+    }
+    let developer_id = "019f9e5ac6687902b0e72fe53abfbef1";
+    connection.execute("INSERT INTO developers(id,certificate_developer_id,developer_type,display_name,status,verification_status,created_at,updated_at) VALUES(?1,?1,'individual','Fixture','active','verified',1,1)",[developer_id]).unwrap();
+    connection.execute("INSERT INTO certificate_requests(id,developer_id,requested_by_account_id,signature_algorithm,subject_public_key,subject_key_id,package_id_scopes_json,allowed_capabilities_json,status,created_at,updated_at) VALUES('request',?1,'account','ed25519','public','subject','[]','[]','issued',1,1)",[developer_id]).unwrap();
+    connection.execute("INSERT INTO certificates(id,certificate_request_id,developer_id,serial_number,issuer_key_id,subject_key_id,certificate_json,not_before,not_after,status,created_at,issuance_source) VALUES('certificate','request',?1,'1','issuer','subject','wire',1,2,'active',1,'online_intermediate')",[developer_id]).unwrap();
+
+    connection
+        .execute_batch(CERTIFICATE_DISPLAY_NAMES)
+        .expect("add certificate display names");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT display_name FROM certificates WHERE id='certificate'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        ""
+    );
+    connection
+        .execute(
+            "UPDATE certificates SET display_name='Release signing' WHERE id='certificate'",
+            [],
+        )
+        .expect("name certificate");
+    assert!(
+        connection
+            .execute(
+                "UPDATE certificates SET display_name=?1 WHERE id='certificate'",
+                ["x".repeat(81)],
+            )
+            .is_err()
+    );
+}
 
 #[test]
 fn developer_and_certificate_suspensions_are_reversible() {

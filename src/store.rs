@@ -606,7 +606,7 @@ pub async fn issue_certificate(
 
 pub async fn certificate(db: &D1Database, certificate_id: &str) -> Result<Option<CertificateRow>> {
     db.prepare(
-        "SELECT c.id, c.certificate_request_id, c.developer_id, c.serial_number, c.issuer_key_id, c.subject_key_id,
+        "SELECT c.id, c.display_name, c.certificate_request_id, c.developer_id, c.serial_number, c.issuer_key_id, c.subject_key_id,
          c.certificate_json, c.not_before, c.not_after,
          CASE WHEN c.status='revoked' THEN 'revoked' WHEN s.certificate_id IS NOT NULL THEN 'suspended' ELSE c.status END AS status,
          c.created_at, c.issuance_source, c.issued_by_account_id
@@ -617,7 +617,7 @@ pub async fn certificate(db: &D1Database, certificate_id: &str) -> Result<Option
 
 pub async fn list_certificates(db: &D1Database, developer_id: &str) -> Result<Vec<CertificateRow>> {
     all(db.prepare(
-        "SELECT c.id, c.certificate_request_id, c.developer_id, c.serial_number, c.issuer_key_id, c.subject_key_id,
+        "SELECT c.id, c.display_name, c.certificate_request_id, c.developer_id, c.serial_number, c.issuer_key_id, c.subject_key_id,
          c.certificate_json, c.not_before, c.not_after,
          CASE WHEN c.status='revoked' THEN 'revoked' WHEN s.certificate_id IS NOT NULL THEN 'suspended' ELSE c.status END AS status,
          c.created_at, c.issuance_source, c.issued_by_account_id
@@ -628,7 +628,7 @@ pub async fn list_certificates(db: &D1Database, developer_id: &str) -> Result<Ve
 
 pub async fn active_certificates(db: &D1Database) -> Result<Vec<CertificateRow>> {
     all(db.prepare(
-        "SELECT c.id, c.certificate_request_id, c.developer_id, c.serial_number, c.issuer_key_id, c.subject_key_id,
+        "SELECT c.id, c.display_name, c.certificate_request_id, c.developer_id, c.serial_number, c.issuer_key_id, c.subject_key_id,
          c.certificate_json, c.not_before, c.not_after,
          CASE WHEN c.status='revoked' THEN 'revoked' WHEN s.certificate_id IS NOT NULL THEN 'suspended' ELSE c.status END AS status,
          c.created_at, c.issuance_source, c.issued_by_account_id
@@ -636,6 +636,46 @@ pub async fn active_certificates(db: &D1Database) -> Result<Vec<CertificateRow>>
          WHERE c.status='active' ORDER BY c.created_at DESC LIMIT 100",
     ))
     .await
+}
+
+pub async fn update_certificate_display_name(
+    db: &D1Database,
+    developer_id: &str,
+    certificate_id: &str,
+    display_name: &str,
+    actor: &str,
+    now: i64,
+) -> Result<Option<CertificateRow>> {
+    let metadata = serde_json::to_string(&serde_json::json!({
+        "certificate_id": certificate_id,
+        "display_name": display_name,
+    }))?;
+    db.batch(vec![
+        db.prepare("UPDATE certificates SET display_name=?1 WHERE id=?2 AND developer_id=?3")
+            .bind(&[
+                value(display_name),
+                value(certificate_id),
+                value(developer_id),
+            ])?,
+        db.prepare(
+            "INSERT INTO audit_logs
+             (id, developer_id, actor_account_id, event_type, metadata_json, created_at)
+             SELECT ?1, ?2, ?3, 'certificate.display_name_updated', ?4, ?5
+             WHERE EXISTS (SELECT 1 FROM certificates WHERE id=?6 AND developer_id=?2)",
+        )
+        .bind(&[
+            value(id(now)),
+            value(developer_id),
+            value(actor),
+            value(metadata),
+            number(now),
+            value(certificate_id),
+        ])?,
+    ])
+    .await?;
+    certificate(db, certificate_id)
+        .await
+        .map(|certificate| certificate.filter(|row| row.developer_id == developer_id))
 }
 
 pub async fn set_certificate_suspension(

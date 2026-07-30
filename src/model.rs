@@ -94,9 +94,16 @@ pub struct RevokeInput {
     pub reason_code: Option<mochios_developer_ca_trust::RevocationReasonCode>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateCertificate {
+    pub display_name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificateRow {
     pub id: String,
+    pub display_name: String,
     pub certificate_request_id: String,
     pub developer_id: String,
     pub serial_number: String,
