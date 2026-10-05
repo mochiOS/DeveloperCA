@@ -21,3 +21,8 @@ binding = "DB"
 database_name = "mochios-developer-ca"
 database_id = "4cea84e3-6120-4a62-983a-8af796a899ea"
 migrations_dir = "migrations"
+
+[[secrets_store_secrets]]
+binding = "CONSOLE_SERVICE_TOKEN"
+store_id = "bf2cdab48681486ebdb4f4e86db72530"
+secret_name = "CONSOLE_SERVICE_TOKEN"
