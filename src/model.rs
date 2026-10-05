@@ -179,7 +179,7 @@ pub struct DeveloperEnrollment {
     pub developer_type: String,
     pub organization_type: Option<String>,
 
-    #[serde(rename = "display_name")]
+    #[serde(rename = "display_name", alias = "display_legal_name")]
     pub display_legal_name: String,
 
     pub organization_name: Option<String>,
