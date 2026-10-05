@@ -57,6 +57,9 @@ fn service_headers(env: &worker::Env) -> Result<Headers> {
 }
 
 pub async fn account(req: &Request, env: &worker::Env) -> Result<Option<String>> {
+    if let Some(account_id) = console_account(req, env).await? {
+        return Ok(Some(account_id));
+    }
     let authorization = req.headers().get("Authorization")?.unwrap_or_default();
     let token = authorization
         .strip_prefix("Bearer ")
@@ -67,10 +70,9 @@ pub async fn account(req: &Request, env: &worker::Env) -> Result<Option<String>>
             .await?
             .map(|claims| claims.sub));
     }
-    if token.is_none() {
+    let Some(token) = token else {
         return Ok(None);
-    }
-    let token = token.unwrap_or_default();
+    };
     let base = env.var("ACCOUNTS_BASE_URL")?.to_string();
     let headers = service_headers(env)?;
     headers.set("Content-Type", "application/json")?;
@@ -78,7 +80,10 @@ pub async fn account(req: &Request, env: &worker::Env) -> Result<Option<String>>
     init.with_method(Method::Post)
         .with_headers(headers)
         .with_body(Some(JsValue::from_str(
-            &serde_json::json!({"token": token}).to_string(),
+            &serde_json::json!({
+                "token": token
+            })
+            .to_string(),
         )));
     let request = Request::new_with_init(
         &format!(
@@ -335,4 +340,46 @@ mod tests {
         value.aud = "developer-ca-admin".into();
         assert!(!cli_claims_match(&value));
     }
+}
+
+fn constant_time_string_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let length = left.len().max(right.len());
+
+    let mut difference = left.len() ^ right.len();
+
+    for index in 0..length {
+        let a = left.get(index).copied().unwrap_or(0);
+        let b = right.get(index).copied().unwrap_or(0);
+        difference |= usize::from(a ^ b);
+    }
+
+    difference == 0
+}
+
+pub async fn console_account(req: &Request, env: &worker::Env) -> Result<Option<String>> {
+    let expected = env.secret("CONSOLE_SERVICE_TOKEN")?.to_string();
+    let provided = req
+        .headers()
+        .get("X-Console-Service-Token")?
+        .unwrap_or_default();
+
+    if expected.is_empty() || !constant_time_string_eq(&expected, &provided) {
+        return Ok(None);
+    }
+
+    let account_id = req.headers().get("X-Account-ID")?.unwrap_or_default();
+
+    let account_id = account_id.trim();
+
+    if account_id.is_empty() || account_id.len() > 128 {
+        return Ok(None);
+    }
+
+    if !account_is_active(account_id, env).await? {
+        return Ok(None);
+    }
+
+    Ok(Some(account_id.to_owned()))
 }

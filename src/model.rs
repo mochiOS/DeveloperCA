@@ -171,3 +171,63 @@ pub struct RevocationSnapshotRow {
     pub is_current: i64,
     pub created_at: i64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeveloperEnrollment {
+    pub id: String,
+    pub applicant_account_id: String,
+    pub developer_type: String,
+    pub organization_type: Option<String>,
+
+    #[serde(rename = "display_name")]
+    pub display_legal_name: String,
+
+    pub organization_name: Option<String>,
+    pub country_region: String,
+    pub website: Option<String>,
+    pub account_holder_account_id: Option<String>,
+    pub agreement_version: String,
+    pub state: String,
+    pub submitted_at: Option<i64>,
+    pub reviewed_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateDeveloperEnrollment {
+    pub developer_type: String,
+
+    #[serde(alias = "display_legal_name")]
+    pub display_name: String,
+
+    pub organization_type: Option<String>,
+    pub organization_name: Option<String>,
+    pub country_region: String,
+    pub website: Option<String>,
+    pub account_holder_account_id: Option<String>,
+    pub agreement_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentDecisionInput {
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeveloperEnrollmentMessage {
+    pub id: String,
+    pub enrollment_id: String,
+    pub author_account_id: String,
+    pub author_kind: String,
+    pub message: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateEnrollmentMessage {
+    pub message: String,
+}

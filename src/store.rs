@@ -4,8 +4,8 @@ use worker::{D1Database, Result, wasm_bindgen::JsValue};
 
 use crate::certificate::CertificateRequestInput;
 use crate::model::{
-    CertificateRow, CreationRequest, Developer, IssuerRow, Member, Revocation,
-    RevocationSnapshotRow, TrustSnapshotRow,
+    CertificateRow, CreationRequest, Developer, DeveloperEnrollment, DeveloperEnrollmentMessage,
+    IssuerRow, Member, Revocation, RevocationSnapshotRow, TrustSnapshotRow,
 };
 
 fn value(value: impl AsRef<str>) -> JsValue {
@@ -1002,4 +1002,663 @@ mod tests {
         let parsed = Uuid::parse_str(&id(1_700_000_000)).unwrap();
         assert_eq!(parsed.get_version_num(), 7);
     }
+}
+
+pub async fn developer_enrollment(
+    db: &D1Database,
+    enrollment_id: &str,
+) -> Result<Option<DeveloperEnrollment>> {
+    db.prepare(
+        "SELECT
+			id,
+			applicant_account_id,
+			developer_type,
+			organization_type,
+			display_legal_name,
+			organization_name,
+			country_region,
+			website,
+			account_holder_account_id,
+			agreement_version,
+			state,
+			submitted_at,
+			reviewed_at,
+			created_at,
+			updated_at
+		FROM developer_enrollments
+		WHERE id = ?1",
+    )
+    .bind(&[value(enrollment_id)])?
+    .first(None)
+    .await
+}
+
+pub async fn list_developer_enrollments(
+    db: &D1Database,
+    account_id: &str,
+) -> Result<Vec<DeveloperEnrollment>> {
+    all(db
+        .prepare(
+            "SELECT
+				id,
+				applicant_account_id,
+				developer_type,
+				organization_type,
+				display_legal_name,
+				organization_name,
+				country_region,
+				website,
+				account_holder_account_id,
+				agreement_version,
+				state,
+				submitted_at,
+				reviewed_at,
+				created_at,
+				updated_at
+			FROM developer_enrollments
+			WHERE applicant_account_id = ?1
+			ORDER BY created_at DESC",
+        )
+        .bind(&[value(account_id)])?)
+    .await
+}
+
+pub async fn list_reviewable_developer_enrollments(
+    db: &D1Database,
+) -> Result<Vec<DeveloperEnrollment>> {
+    all(db.prepare(
+        "SELECT
+				id,
+				applicant_account_id,
+				developer_type,
+				organization_type,
+				display_legal_name,
+				organization_name,
+				country_region,
+				website,
+				account_holder_account_id,
+				agreement_version,
+				state,
+				submitted_at,
+				reviewed_at,
+				created_at,
+				updated_at
+			FROM developer_enrollments
+			WHERE state IN (
+				'submitted',
+				'in_review',
+				'information_required'
+			)
+			ORDER BY
+				CASE state
+					WHEN 'submitted' THEN 0
+					WHEN 'in_review' THEN 1
+					ELSE 2
+				END,
+				submitted_at ASC",
+    ))
+    .await
+}
+
+pub struct NewDeveloperEnrollment<'a> {
+    pub applicant_account_id: &'a str,
+    pub developer_type: &'a str,
+    pub organization_type: Option<&'a str>,
+    pub display_legal_name: &'a str,
+    pub organization_name: Option<&'a str>,
+    pub country_region: &'a str,
+    pub website: Option<&'a str>,
+    pub account_holder_account_id: Option<&'a str>,
+    pub agreement_version: &'a str,
+}
+
+pub async fn create_developer_enrollment(
+    db: &D1Database,
+    input: NewDeveloperEnrollment<'_>,
+    now: i64,
+) -> Result<DeveloperEnrollment> {
+    let enrollment_id = id(now);
+
+    let metadata = serde_json::to_string(&serde_json::json!({
+        "developer_type": input.developer_type,
+    }))?;
+
+    db.batch(vec![
+        db.prepare(
+            "INSERT INTO developer_enrollments (
+				id,
+				applicant_account_id,
+				developer_type,
+				organization_type,
+				display_legal_name,
+				organization_name,
+				country_region,
+				website,
+				account_holder_account_id,
+				agreement_version,
+				state,
+				created_at,
+				updated_at
+			)
+			VALUES (
+				?1, ?2, ?3, ?4, ?5, ?6, ?7,
+				?8, ?9, ?10, 'draft', ?11, ?11
+			)",
+        )
+        .bind(&[
+            value(&enrollment_id),
+            value(input.applicant_account_id),
+            value(input.developer_type),
+            nullable(input.organization_type),
+            value(input.display_legal_name),
+            nullable(input.organization_name),
+            value(input.country_region),
+            nullable(input.website),
+            nullable(input.account_holder_account_id),
+            value(input.agreement_version),
+            number(now),
+        ])?,
+        db.prepare(
+            "INSERT INTO developer_enrollment_events (
+				id,
+				enrollment_id,
+				actor_account_id,
+				event_type,
+				metadata_json,
+				created_at
+			)
+			VALUES (?1, ?2, ?3, 'enrollment.created', ?4, ?5)",
+        )
+        .bind(&[
+            value(id(now)),
+            value(&enrollment_id),
+            value(input.applicant_account_id),
+            value(metadata),
+            number(now),
+        ])?,
+    ])
+    .await?;
+
+    developer_enrollment(db, &enrollment_id)
+        .await?
+        .ok_or_else(|| {
+            worker::Error::RustError("developer enrollment disappeared after creation".into())
+        })
+}
+
+pub async fn submit_developer_enrollment(
+    db: &D1Database,
+    enrollment_id: &str,
+    account_id: &str,
+    now: i64,
+) -> Result<Option<DeveloperEnrollment>> {
+    let changed = db
+        .prepare(
+            "UPDATE developer_enrollments
+			SET
+				state = 'submitted',
+				submitted_at = ?1,
+				updated_at = ?1
+			WHERE id = ?2
+			  AND applicant_account_id = ?3
+			  AND state = 'draft'",
+        )
+        .bind(&[number(now), value(enrollment_id), value(account_id)])?
+        .run()
+        .await?
+        .meta()?
+        .and_then(|metadata| metadata.changes)
+        .unwrap_or(0);
+
+    if changed == 0 {
+        return developer_enrollment(db, enrollment_id).await;
+    }
+
+    db.prepare(
+        "INSERT INTO developer_enrollment_events (
+			id,
+			enrollment_id,
+			actor_account_id,
+			event_type,
+			metadata_json,
+			created_at
+		)
+		VALUES (?1, ?2, ?3, 'enrollment.submitted', '{}', ?4)",
+    )
+    .bind(&[
+        value(id(now)),
+        value(enrollment_id),
+        value(account_id),
+        number(now),
+    ])?
+    .run()
+    .await?;
+
+    developer_enrollment(db, enrollment_id).await
+}
+
+pub async fn begin_developer_enrollment_review(
+    db: &D1Database,
+    enrollment_id: &str,
+    reviewer: &str,
+    now: i64,
+) -> Result<Option<DeveloperEnrollment>> {
+    let changed = db
+        .prepare(
+            "UPDATE developer_enrollments
+			SET
+				state = 'in_review',
+				updated_at = ?1
+			WHERE id = ?2
+			  AND state = 'submitted'",
+        )
+        .bind(&[number(now), value(enrollment_id)])?
+        .run()
+        .await?
+        .meta()?
+        .and_then(|metadata| metadata.changes)
+        .unwrap_or(0);
+
+    if changed != 0 {
+        db.prepare(
+            "INSERT INTO developer_enrollment_events (
+				id,
+				enrollment_id,
+				actor_account_id,
+				event_type,
+				metadata_json,
+				created_at
+			)
+			VALUES (?1, ?2, ?3, 'enrollment.review_started', '{}', ?4)",
+        )
+        .bind(&[
+            value(id(now)),
+            value(enrollment_id),
+            value(reviewer),
+            number(now),
+        ])?
+        .run()
+        .await?;
+    }
+
+    developer_enrollment(db, enrollment_id).await
+}
+
+pub async fn request_developer_enrollment_information(
+    db: &D1Database,
+    enrollment_id: &str,
+    reviewer: &str,
+    reason: &str,
+    now: i64,
+) -> Result<Option<DeveloperEnrollment>> {
+    let metadata = serde_json::to_string(&serde_json::json!({
+        "reason": reason,
+    }))?;
+
+    let changed = db
+        .prepare(
+            "UPDATE developer_enrollments
+			SET
+				state = 'information_required',
+				reviewed_at = ?1,
+				updated_at = ?1
+			WHERE id = ?2
+			  AND state = 'in_review'",
+        )
+        .bind(&[number(now), value(enrollment_id)])?
+        .run()
+        .await?
+        .meta()?
+        .and_then(|metadata| metadata.changes)
+        .unwrap_or(0);
+
+    if changed != 0 {
+        db.batch(vec![
+            db.prepare(
+                "INSERT INTO developer_enrollment_events (
+					id,
+					enrollment_id,
+					actor_account_id,
+					event_type,
+					metadata_json,
+					created_at
+				)
+				VALUES (
+					?1,
+					?2,
+					?3,
+					'enrollment.information_required',
+					?4,
+					?5
+				)",
+            )
+            .bind(&[
+                value(id(now)),
+                value(enrollment_id),
+                value(reviewer),
+                value(metadata),
+                number(now),
+            ])?,
+            db.prepare(
+                "INSERT INTO developer_enrollment_messages (
+					id,
+					enrollment_id,
+					author_account_id,
+					author_kind,
+					message,
+					created_at
+				)
+				VALUES (?1, ?2, ?3, 'reviewer', ?4, ?5)",
+            )
+            .bind(&[
+                value(id(now)),
+                value(enrollment_id),
+                value(reviewer),
+                value(reason),
+                number(now),
+            ])?,
+        ])
+        .await?;
+    }
+
+    developer_enrollment(db, enrollment_id).await
+}
+
+pub async fn reject_developer_enrollment(
+    db: &D1Database,
+    enrollment_id: &str,
+    reviewer: &str,
+    reason: &str,
+    now: i64,
+) -> Result<Option<DeveloperEnrollment>> {
+    let metadata = serde_json::to_string(&serde_json::json!({
+        "reason": reason,
+    }))?;
+
+    let changed = db
+        .prepare(
+            "UPDATE developer_enrollments
+			SET
+				state = 'rejected',
+				reviewed_at = ?1,
+				updated_at = ?1
+			WHERE id = ?2
+			  AND state = 'in_review'",
+        )
+        .bind(&[number(now), value(enrollment_id)])?
+        .run()
+        .await?
+        .meta()?
+        .and_then(|metadata| metadata.changes)
+        .unwrap_or(0);
+
+    if changed != 0 {
+        db.prepare(
+            "INSERT INTO developer_enrollment_events (
+				id,
+				enrollment_id,
+				actor_account_id,
+				event_type,
+				metadata_json,
+				created_at
+			)
+			VALUES (
+				?1,
+				?2,
+				?3,
+				'enrollment.rejected',
+				?4,
+				?5
+			)",
+        )
+        .bind(&[
+            value(id(now)),
+            value(enrollment_id),
+            value(reviewer),
+            value(metadata),
+            number(now),
+        ])?
+        .run()
+        .await?;
+    }
+
+    developer_enrollment(db, enrollment_id).await
+}
+
+pub async fn approve_developer_enrollment(
+    db: &D1Database,
+    enrollment_id: &str,
+    reviewer: &str,
+    now: i64,
+) -> Result<Option<Developer>> {
+    let Some(enrollment) = developer_enrollment(db, enrollment_id).await? else {
+        return Ok(None);
+    };
+
+    if enrollment.state != "in_review" {
+        return Ok(None);
+    }
+
+    let developer_id = developer_id(now);
+    let member_id = id(now);
+
+    let display_name = enrollment
+        .organization_name
+        .as_deref()
+        .unwrap_or(&enrollment.display_legal_name);
+
+    let event_metadata = serde_json::to_string(&serde_json::json!({
+        "developer_id": developer_id,
+    }))?;
+
+    db.batch(vec![
+        db.prepare(
+            "INSERT INTO developers (
+				id,
+				certificate_developer_id,
+				developer_type,
+				display_name,
+				status,
+				verification_status,
+				created_at,
+				updated_at
+			)
+			SELECT
+				?1,
+				?1,
+				developer_type,
+				?2,
+				'active',
+				'verified',
+				?3,
+				?3
+			FROM developer_enrollments
+			WHERE id = ?4
+			  AND state = 'in_review'",
+        )
+        .bind(&[
+            value(&developer_id),
+            value(display_name),
+            number(now),
+            value(enrollment_id),
+        ])?,
+        db.prepare(
+            "INSERT INTO developer_members (
+				id,
+				developer_id,
+				account_id,
+				role,
+				status,
+				created_at,
+				updated_at
+			)
+			SELECT
+				?1,
+				?2,
+				applicant_account_id,
+				'owner',
+				'active',
+				?3,
+				?3
+			FROM developer_enrollments
+			WHERE id = ?4
+			  AND state = 'in_review'
+			  AND EXISTS (
+				  SELECT 1
+				  FROM developers
+				  WHERE id = ?2
+			  )",
+        )
+        .bind(&[
+            value(&member_id),
+            value(&developer_id),
+            number(now),
+            value(enrollment_id),
+        ])?,
+        db.prepare(
+            "UPDATE developer_enrollments
+			SET
+				state = 'approved',
+				reviewed_at = ?1,
+				updated_at = ?1
+			WHERE id = ?2
+			  AND state = 'in_review'
+			  AND EXISTS (
+				  SELECT 1
+				  FROM developers
+				  WHERE id = ?3
+			  )",
+        )
+        .bind(&[number(now), value(enrollment_id), value(&developer_id)])?,
+        db.prepare(
+            "INSERT INTO developer_enrollment_events (
+				id,
+				enrollment_id,
+				actor_account_id,
+				event_type,
+				metadata_json,
+				created_at
+			)
+			SELECT
+				?1,
+				?2,
+				?3,
+				'enrollment.approved',
+				?4,
+				?5
+			WHERE EXISTS (
+				SELECT 1
+				FROM developer_enrollments
+				WHERE id = ?2
+				  AND state = 'approved'
+			)",
+        )
+        .bind(&[
+            value(id(now)),
+            value(enrollment_id),
+            value(reviewer),
+            value(event_metadata),
+            number(now),
+        ])?,
+        db.prepare(
+            "INSERT INTO audit_logs (
+				id,
+				developer_id,
+				actor_account_id,
+				event_type,
+				metadata_json,
+				created_at
+			)
+			SELECT
+				?1,
+				?2,
+				?3,
+				'developer.created_from_enrollment',
+				?4,
+				?5
+			WHERE EXISTS (
+				SELECT 1
+				FROM developers
+				WHERE id = ?2
+			)",
+        )
+        .bind(&[
+            value(id(now)),
+            value(&developer_id),
+            value(reviewer),
+            value(serde_json::to_string(&serde_json::json!({
+                "enrollment_id": enrollment_id,
+            }))?),
+            number(now),
+        ])?,
+    ])
+    .await?;
+
+    developer(db, &developer_id).await
+}
+
+pub async fn add_developer_enrollment_message(
+    db: &D1Database,
+    enrollment_id: &str,
+    account_id: &str,
+    message: &str,
+    now: i64,
+) -> Result<bool> {
+    let result = db
+        .prepare(
+            "INSERT INTO developer_enrollment_messages (
+				id,
+				enrollment_id,
+				author_account_id,
+				author_kind,
+				message,
+				created_at
+			)
+			SELECT
+				?1,
+				id,
+				?2,
+				'developer',
+				?3,
+				?4
+			FROM developer_enrollments
+			WHERE id = ?5
+			  AND applicant_account_id = ?2
+			  AND state = 'information_required'",
+        )
+        .bind(&[
+            value(id(now)),
+            value(account_id),
+            value(message),
+            number(now),
+            value(enrollment_id),
+        ])?
+        .run()
+        .await?;
+
+    Ok(result
+        .meta()?
+        .and_then(|metadata| metadata.changes)
+        .is_some_and(|changes| changes == 1))
+}
+
+pub async fn list_developer_enrollment_messages(
+    db: &D1Database,
+    enrollment_id: &str,
+) -> Result<Vec<DeveloperEnrollmentMessage>> {
+    all(db
+        .prepare(
+            "SELECT
+				id,
+				enrollment_id,
+				author_account_id,
+				author_kind,
+				message,
+				created_at
+			FROM developer_enrollment_messages
+			WHERE enrollment_id = ?1
+			ORDER BY created_at ASC",
+        )
+        .bind(&[value(enrollment_id)])?)
+    .await
 }

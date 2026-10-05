@@ -2106,6 +2106,36 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             "/v1/admin/certificates/:certificate_id/revoke",
             admin_revoke,
         )
+        .get_async("/v1/developer-enrollments", list_developer_enrollments)
+        .post_async("/v1/developer-enrollments", create_developer_enrollment)
+        .get_async(
+            "/v1/developer-enrollments/:enrollment_id",
+            get_developer_enrollment,
+        )
+        .post_async(
+            "/v1/developer-enrollments/:enrollment_id/submit",
+            submit_developer_enrollment,
+        )
+        .get_async(
+            "/v1/admin/developer-enrollments",
+            admin_list_developer_enrollments,
+        )
+        .post_async(
+            "/v1/admin/developer-enrollments/:enrollment_id/begin-review",
+            admin_begin_developer_enrollment_review,
+        )
+        .post_async(
+            "/v1/admin/developer-enrollments/:enrollment_id/approve",
+            admin_approve_developer_enrollment,
+        )
+        .post_async(
+            "/v1/admin/developer-enrollments/:enrollment_id/reject",
+            admin_reject_developer_enrollment,
+        )
+        .post_async(
+            "/v1/admin/developer-enrollments/:enrollment_id/request-information",
+            admin_request_developer_enrollment_information,
+        )
         .run(req, env)
         .await
 }
@@ -2277,4 +2307,445 @@ mod tests {
             "active", "pending", "active", "owner"
         ));
     }
+}
+
+fn valid_organization_type(value: &str) -> bool {
+    matches!(value, "company" | "nonprofit" | "community" | "other")
+}
+
+fn valid_enrollment_input(input: &CreateDeveloperEnrollment, account_id: &str) -> bool {
+    let name = input.display_name.trim();
+    let country = input.country_region.trim();
+    let agreement = input.agreement_version.trim();
+
+    if !valid_developer_type(&input.developer_type)
+        || name.is_empty()
+        || name.chars().count() > 120
+        || country.is_empty()
+        || country.chars().count() > 80
+        || agreement.is_empty()
+        || agreement.chars().count() > 80
+    {
+        return false;
+    }
+
+    match input.developer_type.as_str() {
+        "individual" => {
+            input.organization_type.is_none()
+                && input.organization_name.is_none()
+                && input.account_holder_account_id.is_none()
+        }
+        "organization" => {
+            input
+                .organization_type
+                .as_deref()
+                .is_some_and(valid_organization_type)
+                && input.organization_name.as_deref().is_some_and(|value| {
+                    let value = value.trim();
+                    !value.is_empty() && value.chars().count() <= 120
+                })
+                && input
+                    .account_holder_account_id
+                    .as_deref()
+                    .is_none_or(|value| value == account_id)
+        }
+        _ => false,
+    }
+}
+
+async fn list_developer_enrollments(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let Some(account_id) = user(&req, &ctx.env).await? else {
+        return error("UNAUTHENTICATED", "Active Accounts session required", 401);
+    };
+
+    let enrollments = store::list_developer_enrollments(&ctx.env.d1("DB")?, &account_id).await?;
+
+    json_response(
+        &json!({
+            "enrollments": enrollments,
+        }),
+        200,
+    )
+}
+
+async fn get_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let Some(account_id) = user(&req, &ctx.env).await? else {
+        return error("UNAUTHENTICATED", "Active Accounts session required", 401);
+    };
+
+    let enrollment_id = param(&ctx, "enrollment_id");
+
+    let Some(enrollment) = store::developer_enrollment(&ctx.env.d1("DB")?, enrollment_id).await?
+    else {
+        return error(
+            "ENROLLMENT_NOT_FOUND",
+            "Developer enrollment not found",
+            404,
+        );
+    };
+
+    if enrollment.applicant_account_id != account_id {
+        return error(
+            "FORBIDDEN",
+            "This enrollment belongs to another Account",
+            403,
+        );
+    }
+
+    json_response(
+        &json!({
+            "enrollment": enrollment,
+        }),
+        200,
+    )
+}
+
+async fn create_developer_enrollment(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let Some(account_id) = user(&req, &ctx.env).await? else {
+        return error("UNAUTHENTICATED", "Active Accounts session required", 401);
+    };
+
+    let input: CreateDeveloperEnrollment = match req.json().await {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                "ENROLLMENT_INPUT_INVALID",
+                "Developer enrollment input is invalid",
+                400,
+            );
+        }
+    };
+
+    if !valid_enrollment_input(&input, &account_id) {
+        return error(
+            "ENROLLMENT_INPUT_INVALID",
+            "Developer enrollment input is invalid",
+            422,
+        );
+    }
+
+    let organization_name = input.organization_name.as_deref().map(str::trim);
+
+    let organization_type = input.organization_type.as_deref().map(str::trim);
+
+    let website = input
+        .website
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let account_holder = if input.developer_type == "organization" {
+        Some(
+            input
+                .account_holder_account_id
+                .as_deref()
+                .unwrap_or(&account_id),
+        )
+    } else {
+        None
+    };
+
+    let enrollment = store::create_developer_enrollment(
+        &ctx.env.d1("DB")?,
+        store::NewDeveloperEnrollment {
+            applicant_account_id: &account_id,
+            developer_type: &input.developer_type,
+            organization_type,
+            display_legal_name: input.display_name.trim(),
+            organization_name,
+            country_region: input.country_region.trim(),
+            website,
+            account_holder_account_id: account_holder,
+            agreement_version: input.agreement_version.trim(),
+        },
+        now(),
+    )
+    .await?;
+
+    json_response(
+        &json!({
+            "enrollment": enrollment,
+        }),
+        201,
+    )
+}
+
+async fn submit_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let Some(account_id) = user(&req, &ctx.env).await? else {
+        return error("UNAUTHENTICATED", "Active Accounts session required", 401);
+    };
+
+    let enrollment_id = param(&ctx, "enrollment_id");
+
+    let Some(current) = store::developer_enrollment(&ctx.env.d1("DB")?, enrollment_id).await?
+    else {
+        return error(
+            "ENROLLMENT_NOT_FOUND",
+            "Developer enrollment not found",
+            404,
+        );
+    };
+
+    if current.applicant_account_id != account_id {
+        return error(
+            "FORBIDDEN",
+            "This enrollment belongs to another Account",
+            403,
+        );
+    }
+
+    if current.state != "draft" {
+        return error(
+            "ENROLLMENT_STATE_INVALID",
+            "Only draft enrollments can be submitted",
+            409,
+        );
+    }
+
+    let enrollment =
+        store::submit_developer_enrollment(&ctx.env.d1("DB")?, enrollment_id, &account_id, now())
+            .await?
+            .ok_or_else(|| {
+                worker::Error::RustError("developer enrollment disappeared after submission".into())
+            })?;
+
+    json_response(
+        &json!({
+            "enrollment": enrollment,
+        }),
+        200,
+    )
+}
+
+async fn admin_list_developer_enrollments(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let Some(_actor) = require_admin(&req, &ctx.env).await? else {
+        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
+    };
+
+    let enrollments = store::list_reviewable_developer_enrollments(&ctx.env.d1("DB")?).await?;
+
+    json_response(
+        &json!({
+            "enrollments": enrollments,
+        }),
+        200,
+    )
+}
+
+async fn admin_begin_developer_enrollment_review(
+    req: Request,
+    ctx: RouteContext<()>,
+) -> Result<Response> {
+    let Some(actor) = require_admin(&req, &ctx.env).await? else {
+        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
+    };
+
+    if !consume_admin_action(&actor, &ctx.env, "developer_enrollment.begin_review").await? {
+        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
+    }
+
+    let enrollment_id = param(&ctx, "enrollment_id");
+
+    let Some(enrollment) = store::begin_developer_enrollment_review(
+        &ctx.env.d1("DB")?,
+        enrollment_id,
+        &actor.account_id,
+        now(),
+    )
+    .await?
+    else {
+        return error(
+            "ENROLLMENT_NOT_FOUND",
+            "Developer enrollment not found",
+            404,
+        );
+    };
+
+    if enrollment.state != "in_review" {
+        return error(
+            "ENROLLMENT_STATE_INVALID",
+            "Enrollment cannot enter review from its current state",
+            409,
+        );
+    }
+
+    json_response(
+        &json!({
+            "enrollment": enrollment,
+        }),
+        200,
+    )
+}
+
+async fn admin_approve_developer_enrollment(
+    req: Request,
+    ctx: RouteContext<()>,
+) -> Result<Response> {
+    let Some(actor) = require_admin(&req, &ctx.env).await? else {
+        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
+    };
+
+    if !consume_admin_action(&actor, &ctx.env, "developer_enrollment.approve").await? {
+        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
+    }
+
+    let enrollment_id = param(&ctx, "enrollment_id");
+
+    let Some(developer) = store::approve_developer_enrollment(
+        &ctx.env.d1("DB")?,
+        enrollment_id,
+        &actor.account_id,
+        now(),
+    )
+    .await?
+    else {
+        return error(
+            "ENROLLMENT_STATE_INVALID",
+            "Enrollment must be in review before approval",
+            409,
+        );
+    };
+
+    store::record_admin_audit(
+        &ctx.env.d1("DB")?,
+        Some(&developer.id),
+        &actor.account_id,
+        "admin.developer_enrollment.approved",
+        &actor.jti,
+        now(),
+    )
+    .await?;
+
+    json_response(
+        &json!({
+            "developer": developer,
+        }),
+        200,
+    )
+}
+
+async fn admin_reject_developer_enrollment(
+    mut req: Request,
+    ctx: RouteContext<()>,
+) -> Result<Response> {
+    let Some(actor) = require_admin(&req, &ctx.env).await? else {
+        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
+    };
+
+    let input: EnrollmentDecisionInput = req
+        .json()
+        .await
+        .unwrap_or(EnrollmentDecisionInput { reason: None });
+
+    let Some(reason) = input
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return error(
+            "REJECTION_REASON_REQUIRED",
+            "Rejection reason required",
+            422,
+        );
+    };
+
+    if !consume_admin_action(&actor, &ctx.env, "developer_enrollment.reject").await? {
+        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
+    }
+
+    let enrollment_id = param(&ctx, "enrollment_id");
+
+    let Some(enrollment) = store::reject_developer_enrollment(
+        &ctx.env.d1("DB")?,
+        enrollment_id,
+        &actor.account_id,
+        reason,
+        now(),
+    )
+    .await?
+    else {
+        return error(
+            "ENROLLMENT_NOT_FOUND",
+            "Developer enrollment not found",
+            404,
+        );
+    };
+
+    if enrollment.state != "rejected" {
+        return error(
+            "ENROLLMENT_STATE_INVALID",
+            "Enrollment must be in review before rejection",
+            409,
+        );
+    }
+
+    json_response(
+        &json!({
+            "enrollment": enrollment,
+        }),
+        200,
+    )
+}
+
+async fn admin_request_developer_enrollment_information(
+    mut req: Request,
+    ctx: RouteContext<()>,
+) -> Result<Response> {
+    let Some(actor) = require_admin(&req, &ctx.env).await? else {
+        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
+    };
+
+    let input: EnrollmentDecisionInput = match req.json().await {
+        Ok(value) => value,
+        Err(_) => {
+            return error("REQUEST_INVALID", "Request body is invalid", 400);
+        }
+    };
+
+    let Some(reason) = input
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return error("REASON_REQUIRED", "A reason is required", 422);
+    };
+
+    if !consume_admin_action(&actor, &ctx.env, "developer_enrollment.request_information").await? {
+        return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
+    }
+
+    let enrollment_id = param(&ctx, "enrollment_id");
+
+    let Some(enrollment) = store::request_developer_enrollment_information(
+        &ctx.env.d1("DB")?,
+        enrollment_id,
+        &actor.account_id,
+        reason,
+        now(),
+    )
+    .await?
+    else {
+        return error(
+            "ENROLLMENT_NOT_FOUND",
+            "Developer enrollment not found",
+            404,
+        );
+    };
+
+    if enrollment.state != "information_required" {
+        return error(
+            "ENROLLMENT_STATE_INVALID",
+            "Enrollment must be in review before requesting information",
+            409,
+        );
+    }
+
+    json_response(
+        &json!({
+            "enrollment": enrollment,
+        }),
+        200,
+    )
 }
