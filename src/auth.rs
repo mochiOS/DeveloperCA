@@ -157,6 +157,10 @@ fn claims_match(claims: &Claims, audience: &str, role: &str) -> bool {
 }
 
 pub async fn admin(req: &Request, env: &worker::Env) -> Result<Option<AdminActor>> {
+    if let Some(actor) = admin_service(req, env).await? {
+        return Ok(Some(actor));
+    }
+
     Ok(
         delegation(req, env, "developer-ca-admin", "developer_ca_reviewer")
             .await?
@@ -358,8 +362,53 @@ fn constant_time_string_eq(left: &str, right: &str) -> bool {
     difference == 0
 }
 
+async fn admin_service(req: &Request, env: &worker::Env) -> Result<Option<AdminActor>> {
+    let expected = env
+        .secret_store("ADMIN_SERVICE_TOKEN")?
+        .get()
+        .await?
+        .unwrap_or_default();
+
+    let provided = req
+        .headers()
+        .get("X-Admin-Service-Token")?
+        .unwrap_or_default();
+
+    if expected.is_empty() || !constant_time_string_eq(&expected, &provided) {
+        return Ok(None);
+    }
+
+    let actor = req.headers().get("X-Admin-Actor")?.unwrap_or_default();
+
+    let actor = actor.trim();
+
+    if actor.is_empty() || actor.len() > 254 {
+        return Ok(None);
+    }
+
+    let jti = req.headers().get("X-Admin-Action-ID")?.unwrap_or_default();
+
+    let jti = jti.trim();
+
+    if jti.is_empty() || jti.len() > 128 {
+        return Ok(None);
+    }
+
+    let now = (worker::Date::now().as_millis() / 1000) as i64;
+
+    Ok(Some(AdminActor {
+        account_id: actor.to_owned(),
+        jti: jti.to_owned(),
+        expires_at: now + 300,
+    }))
+}
+
 pub async fn console_account(req: &Request, env: &worker::Env) -> Result<Option<String>> {
-    let expected = env.secret("CONSOLE_SERVICE_TOKEN")?.to_string();
+    let expected = env
+        .secret_store("CONSOLE_SERVICE_TOKEN")?
+        .get()
+        .await?
+        .unwrap_or_default();
     let provided = req
         .headers()
         .get("X-Console-Service-Token")?

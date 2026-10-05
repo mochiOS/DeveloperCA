@@ -217,6 +217,16 @@ pub struct EnrollmentDecisionInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeveloperEnrollmentEvent {
+    pub id: String,
+    pub enrollment_id: String,
+    pub actor_account_id: Option<String>,
+    pub event_type: String,
+    pub metadata_json: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeveloperEnrollmentMessage {
     pub id: String,
     pub enrollment_id: String,

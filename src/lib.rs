@@ -2120,6 +2120,10 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             "/v1/admin/developer-enrollments",
             admin_list_developer_enrollments,
         )
+        .get_async(
+            "/v1/admin/developer-enrollments/:enrollment_id",
+            admin_get_developer_enrollment,
+        )
         .post_async(
             "/v1/admin/developer-enrollments/:enrollment_id/begin-review",
             admin_begin_developer_enrollment_review,
@@ -2527,6 +2531,35 @@ async fn admin_list_developer_enrollments(req: Request, ctx: RouteContext<()>) -
     json_response(
         &json!({
             "enrollments": enrollments,
+        }),
+        200,
+    )
+}
+
+async fn admin_get_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let Some(_actor) = require_admin(&req, &ctx.env).await? else {
+        return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
+    };
+
+    let enrollment_id = param(&ctx, "enrollment_id");
+    let db = ctx.env.d1("DB")?;
+
+    let Some(enrollment) = store::developer_enrollment(&db, enrollment_id).await? else {
+        return error(
+            "ENROLLMENT_NOT_FOUND",
+            "Developer enrollment not found",
+            404,
+        );
+    };
+
+    let events = store::list_developer_enrollment_events(&db, enrollment_id).await?;
+    let messages = store::list_developer_enrollment_messages(&db, enrollment_id).await?;
+
+    json_response(
+        &json!({
+            "enrollment": enrollment,
+            "events": events,
+            "messages": messages,
         }),
         200,
     )

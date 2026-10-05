@@ -4,8 +4,9 @@ use worker::{D1Database, Result, wasm_bindgen::JsValue};
 
 use crate::certificate::CertificateRequestInput;
 use crate::model::{
-    CertificateRow, CreationRequest, Developer, DeveloperEnrollment, DeveloperEnrollmentMessage,
-    IssuerRow, Member, Revocation, RevocationSnapshotRow, TrustSnapshotRow,
+    CertificateRow, CreationRequest, Developer, DeveloperEnrollment, DeveloperEnrollmentEvent,
+    DeveloperEnrollmentMessage, IssuerRow, Member, Revocation, RevocationSnapshotRow,
+    TrustSnapshotRow,
 };
 
 fn value(value: impl AsRef<str>) -> JsValue {
@@ -1250,7 +1251,7 @@ pub async fn begin_developer_enrollment_review(
 				state = 'in_review',
 				updated_at = ?1
 			WHERE id = ?2
-			  AND state = 'submitted'",
+			  AND state IN ('submitted', 'information_required')",
         )
         .bind(&[number(now), value(enrollment_id)])?
         .run()
@@ -1656,6 +1657,27 @@ pub async fn list_developer_enrollment_messages(
 				message,
 				created_at
 			FROM developer_enrollment_messages
+			WHERE enrollment_id = ?1
+			ORDER BY created_at ASC",
+        )
+        .bind(&[value(enrollment_id)])?)
+    .await
+}
+
+pub async fn list_developer_enrollment_events(
+    db: &D1Database,
+    enrollment_id: &str,
+) -> Result<Vec<DeveloperEnrollmentEvent>> {
+    all(db
+        .prepare(
+            "SELECT
+				id,
+				enrollment_id,
+				actor_account_id,
+				event_type,
+				metadata_json,
+				created_at
+			FROM developer_enrollment_events
 			WHERE enrollment_id = ?1
 			ORDER BY created_at ASC",
         )

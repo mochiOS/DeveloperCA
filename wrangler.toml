@@ -26,3 +26,8 @@ migrations_dir = "migrations"
 binding = "CONSOLE_SERVICE_TOKEN"
 store_id = "bf2cdab48681486ebdb4f4e86db72530"
 secret_name = "CONSOLE_SERVICE_TOKEN"
+
+[[secrets_store_secrets]]
+binding = "ADMIN_SERVICE_TOKEN"
+store_id = "bf2cdab48681486ebdb4f4e86db72530"
+secret_name = "ADMIN_SERVICE_TOKEN"
