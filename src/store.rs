@@ -5,7 +5,7 @@ use worker::{D1Database, Result, wasm_bindgen::JsValue};
 use crate::certificate::CertificateRequestInput;
 use crate::model::{
     CertificateRow, CreationRequest, Developer, DeveloperEnrollment, DeveloperEnrollmentEvent,
-    DeveloperEnrollmentMessage, IssuerRow, Member, Revocation, RevocationSnapshotRow,
+    DeveloperEnrollmentMessage, IssuerRow, Member, Notification, Revocation, RevocationSnapshotRow,
     TrustSnapshotRow,
 };
 
@@ -108,6 +108,159 @@ pub async fn record_admin_audit(
 
 async fn all<T: DeserializeOwned>(statement: worker::D1PreparedStatement) -> Result<Vec<T>> {
     statement.all().await?.results()
+}
+
+
+fn notification_statement(
+    db: &D1Database,
+    notification_id: &str,
+    account_id: &str,
+    kind: &str,
+    title: &str,
+    message: &str,
+    action_url: Option<&str>,
+    source: &str,
+    source_id: Option<&str>,
+    now: i64,
+) -> Result<worker::D1PreparedStatement> {
+    db.prepare(
+        "INSERT INTO notifications (
+            id,
+            account_id,
+            kind,
+            title,
+            message,
+            action_url,
+            source,
+            source_id,
+            created_at,
+            read_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+    )
+    .bind(&[
+        value(notification_id),
+        value(account_id),
+        value(kind),
+        value(title),
+        value(message),
+        nullable(action_url),
+        value(source),
+        nullable(source_id),
+        number(now),
+    ])
+}
+
+pub async fn send_notification(
+    db: &D1Database,
+    account_id: &str,
+    kind: &str,
+    title: &str,
+    message: &str,
+    action_url: Option<&str>,
+    source: &str,
+    source_id: Option<&str>,
+    now: i64,
+) -> Result<Notification> {
+    let notification_id = id(now);
+    notification_statement(
+        db,
+        &notification_id,
+        account_id,
+        kind,
+        title,
+        message,
+        action_url,
+        source,
+        source_id,
+        now,
+    )?
+    .run()
+    .await?;
+
+    db.prepare(
+        "SELECT
+            id,
+            account_id,
+            kind,
+            title,
+            message,
+            action_url,
+            source,
+            source_id,
+            created_at,
+            read_at
+        FROM notifications
+        WHERE id = ?1",
+    )
+    .bind(&[value(&notification_id)])?
+    .first(None)
+    .await?
+    .ok_or_else(|| worker::Error::RustError("notification disappeared after creation".into()))
+}
+
+pub async fn notifications(
+    db: &D1Database,
+    account_id: &str,
+) -> Result<Vec<Notification>> {
+    all(
+        db.prepare(
+            "SELECT
+                id,
+                account_id,
+                kind,
+                title,
+                message,
+                action_url,
+                source,
+                source_id,
+                created_at,
+                read_at
+            FROM notifications
+            WHERE account_id = ?1
+            ORDER BY created_at DESC, id DESC
+            LIMIT 100",
+        )
+        .bind(&[value(account_id)])?,
+    )
+    .await
+}
+
+pub async fn mark_notification_read(
+    db: &D1Database,
+    notification_id: &str,
+    account_id: &str,
+    now: i64,
+) -> Result<bool> {
+    let result = db
+        .prepare(
+            "UPDATE notifications
+            SET read_at = COALESCE(read_at, ?1)
+            WHERE id = ?2 AND account_id = ?3",
+        )
+        .bind(&[number(now), value(notification_id), value(account_id)])?
+        .run()
+        .await?;
+
+    Ok(result
+        .meta()?
+        .and_then(|metadata| metadata.changes)
+        .is_some_and(|changes| changes == 1))
+}
+
+pub async fn mark_all_notifications_read(
+    db: &D1Database,
+    account_id: &str,
+    now: i64,
+) -> Result<()> {
+    db.prepare(
+        "UPDATE notifications
+        SET read_at = ?1
+        WHERE account_id = ?2 AND read_at IS NULL",
+    )
+    .bind(&[number(now), value(account_id)])?
+    .run()
+    .await?;
+    Ok(())
 }
 
 pub async fn developer(db: &D1Database, developer_id: &str) -> Result<Option<Developer>> {
