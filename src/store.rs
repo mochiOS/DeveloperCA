@@ -234,17 +234,34 @@ pub async fn mark_notification_read(
     let result = db
         .prepare(
             "UPDATE notifications
-            SET read_at = COALESCE(read_at, ?1)
-            WHERE id = ?2 AND account_id = ?3",
+             SET read_at = ?1
+             WHERE id = ?2
+               AND account_id = ?3
+               AND read_at IS NULL",
         )
         .bind(&[number(now), value(notification_id), value(account_id)])?
         .run()
         .await?;
 
-    Ok(result
+    if result
         .meta()?
         .and_then(|metadata| metadata.changes)
-        .is_some_and(|changes| changes == 1))
+        .is_some_and(|changes| changes == 1)
+    {
+        return Ok(true);
+    }
+
+    Ok(db
+        .prepare(
+            "SELECT id
+             FROM notifications
+             WHERE id = ?1 AND account_id = ?2
+             LIMIT 1",
+        )
+        .bind(&[value(notification_id), value(account_id)])?
+        .first::<serde_json::Value>(None)
+        .await?
+        .is_some())
 }
 
 pub async fn mark_all_notifications_read(
