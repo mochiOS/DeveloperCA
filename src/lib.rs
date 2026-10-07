@@ -3092,7 +3092,7 @@ async fn admin_reject_developer_enrollment(
         "warning",
         "Developer registration was not approved",
         reason,
-        Some("/console/developers/edit"),
+        Some("/console"),
         "developer_enrollment",
         Some(enrollment_id),
     )
