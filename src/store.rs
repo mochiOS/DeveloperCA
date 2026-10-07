@@ -1835,10 +1835,44 @@ pub async fn add_developer_enrollment_message(
         .run()
         .await?;
 
-    Ok(result
+    let changed = result
         .meta()?
         .and_then(|metadata| metadata.changes)
-        .is_some_and(|changes| changes == 1))
+        .is_some_and(|changes| changes == 1);
+
+    if changed {
+        db.batch(vec![
+            db.prepare(
+                "UPDATE developer_enrollments
+                 SET updated_at = ?1
+                 WHERE id = ?2 AND applicant_account_id = ?3",
+            )
+            .bind(&[
+                number(now),
+                value(enrollment_id),
+                value(account_id),
+            ])?,
+            db.prepare(
+                "INSERT INTO developer_enrollment_events (
+                    id,
+                    enrollment_id,
+                    actor_account_id,
+                    event_type,
+                    metadata_json,
+                    created_at
+                ) VALUES (?1, ?2, ?3, 'enrollment.developer_message', '{}', ?4)",
+            )
+            .bind(&[
+                value(id(now)),
+                value(enrollment_id),
+                value(account_id),
+                number(now),
+            ])?,
+        ])
+        .await?;
+    }
+
+    Ok(changed)
 }
 
 pub async fn list_developer_enrollment_messages(
