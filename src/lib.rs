@@ -102,23 +102,21 @@ async fn send_notification(
 
 
 async fn send_admin_notification(env: &Env, payload: serde_json::Value) {
-    let token = match env
-        .secret_store("ADMIN_NOTIFICATION_SERVICE_TOKEN")
-        .and_then(|binding| Ok(binding))
-    {
-        Ok(binding) => match binding.get().await {
-            Ok(Some(value)) if !value.is_empty() => value,
-            Ok(_) => {
-                console_error!("admin notification token is unavailable");
-                return;
-            }
-            Err(error) => {
-                console_error!("admin notification token lookup failed: {}", error);
-                return;
-            }
-        },
+    let token_binding = match env.secret_store("ADMIN_NOTIFICATION_SERVICE_TOKEN") {
+        Ok(binding) => binding,
         Err(error) => {
             console_error!("admin notification token binding is unavailable: {}", error);
+            return;
+        }
+    };
+    let token = match token_binding.get().await {
+        Ok(Some(value)) if !value.is_empty() => value,
+        Ok(_) => {
+            console_error!("admin notification token is unavailable");
+            return;
+        }
+        Err(error) => {
+            console_error!("admin notification token lookup failed: {}", error);
             return;
         }
     };
@@ -145,7 +143,7 @@ async fn send_admin_notification(env: &Env, payload: serde_json::Value) {
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_headers(headers)
-        .with_body(Some(wasm_bindgen::JsValue::from_str(&body)));
+        .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&body)));
 
     let request = match Request::new_with_init(
         "https://admin.internal/api/internal/admin-notifications",
