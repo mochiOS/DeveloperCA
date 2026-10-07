@@ -1515,18 +1515,6 @@ pub async fn request_developer_enrollment_information(
                 value(reason),
                 number(now),
             ])?,
-            notification_statement(
-                db,
-                &id(now),
-                &current.applicant_account_id,
-                "action_required",
-                "Developer registration requires information",
-                reason,
-                Some("/console/developers/new"),
-                "developer_enrollment",
-                Some(enrollment_id),
-                now,
-            )?,
         ])
         .await?;
     }
@@ -1593,18 +1581,6 @@ pub async fn reject_developer_enrollment(
                 value(metadata),
                 number(now),
             ])?,
-            notification_statement(
-                db,
-                &id(now),
-                &current.applicant_account_id,
-                "warning",
-                "Developer registration was not approved",
-                reason,
-                Some("/console/developers/new"),
-                "developer_enrollment",
-                Some(enrollment_id),
-                now,
-            )?,
         ])
         .await?;
     }
@@ -1778,18 +1754,6 @@ pub async fn approve_developer_enrollment(
             }))?),
             number(now),
         ])?,
-        notification_statement(
-            db,
-            &id(now),
-            &enrollment.applicant_account_id,
-            "success",
-            "Developer registration approved",
-            "Your Developer registration has been approved.",
-            Some("/console"),
-            "developer_enrollment",
-            Some(enrollment_id),
-            now,
-        )?,
     ])
     .await?;
 
