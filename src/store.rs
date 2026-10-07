@@ -1511,50 +1511,53 @@ pub async fn submit_developer_enrollment(
     account_id: &str,
     now: i64,
 ) -> Result<Option<DeveloperEnrollment>> {
-    let changed = db
-        .prepare(
+    db.batch(vec![
+        db.prepare(
             "UPDATE developer_enrollments
-			SET
-				state = 'submitted',
-				submitted_at = ?1,
-				updated_at = ?1
-			WHERE id = ?2
-			  AND applicant_account_id = ?3
-			  AND state = 'draft'",
+             SET state = 'submitted', submitted_at = ?1, updated_at = ?1
+             WHERE id = ?2
+               AND applicant_account_id = ?3
+               AND state = 'draft'",
         )
-        .bind(&[number(now), value(enrollment_id), value(account_id)])?
-        .run()
-        .await?
-        .meta()?
-        .and_then(|metadata| metadata.changes)
-        .unwrap_or(0);
-
-    if changed == 0 {
-        return developer_enrollment(db, enrollment_id).await;
-    }
-
-    db.prepare(
-        "INSERT INTO developer_enrollment_events (
-			id,
-			enrollment_id,
-			actor_account_id,
-			event_type,
-			metadata_json,
-			created_at
-		)
-		VALUES (?1, ?2, ?3, 'enrollment.submitted', '{}', ?4)",
-    )
-    .bind(&[
-        value(id(now)),
-        value(enrollment_id),
-        value(account_id),
-        number(now),
-    ])?
-    .run()
+        .bind(&[
+            number(now),
+            value(enrollment_id),
+            value(account_id),
+        ])?,
+        db.prepare(
+            "INSERT INTO developer_enrollment_events (
+                id,
+                enrollment_id,
+                actor_account_id,
+                event_type,
+                metadata_json,
+                created_at
+            )
+            SELECT ?1, id, ?2, 'enrollment.submitted', '{}', ?3
+            FROM developer_enrollments
+            WHERE id = ?4
+              AND applicant_account_id = ?2
+              AND state = 'submitted'
+              AND updated_at = ?3
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM developer_enrollment_events e
+                  WHERE e.enrollment_id = developer_enrollments.id
+                    AND e.event_type = 'enrollment.submitted'
+              )",
+        )
+        .bind(&[
+            value(id(now)),
+            value(account_id),
+            number(now),
+            value(enrollment_id),
+        ])?,
+    ])
     .await?;
 
     developer_enrollment(db, enrollment_id).await
 }
+
 
 pub async fn begin_developer_enrollment_review(
     db: &D1Database,
@@ -1562,46 +1565,51 @@ pub async fn begin_developer_enrollment_review(
     reviewer: &str,
     now: i64,
 ) -> Result<Option<DeveloperEnrollment>> {
-    let changed = db
-        .prepare(
+    db.batch(vec![
+        db.prepare(
             "UPDATE developer_enrollments
-			SET
-				state = 'in_review',
-				updated_at = ?1
-			WHERE id = ?2
-			  AND state IN ('submitted', 'information_required')",
+             SET state = 'in_review', updated_at = ?1
+             WHERE id = ?2
+               AND state = 'submitted'",
         )
-        .bind(&[number(now), value(enrollment_id)])?
-        .run()
-        .await?
-        .meta()?
-        .and_then(|metadata| metadata.changes)
-        .unwrap_or(0);
-
-    if changed != 0 {
+        .bind(&[
+            number(now),
+            value(enrollment_id),
+        ])?,
         db.prepare(
             "INSERT INTO developer_enrollment_events (
-				id,
-				enrollment_id,
-				actor_account_id,
-				event_type,
-				metadata_json,
-				created_at
-			)
-			VALUES (?1, ?2, ?3, 'enrollment.review_started', '{}', ?4)",
+                id,
+                enrollment_id,
+                actor_account_id,
+                event_type,
+                metadata_json,
+                created_at
+            )
+            SELECT ?1, id, ?2, 'enrollment.review_started', '{}', ?3
+            FROM developer_enrollments
+            WHERE id = ?4
+              AND state = 'in_review'
+              AND updated_at = ?3
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM developer_enrollment_events e
+                  WHERE e.enrollment_id = developer_enrollments.id
+                    AND e.event_type = 'enrollment.review_started'
+                    AND e.created_at = ?3
+              )",
         )
         .bind(&[
             value(id(now)),
-            value(enrollment_id),
             value(reviewer),
             number(now),
-        ])?
-        .run()
-        .await?;
-    }
+            value(enrollment_id),
+        ])?,
+    ])
+    .await?;
 
     developer_enrollment(db, enrollment_id).await
 }
+
 
 pub async fn request_developer_enrollment_information(
     db: &D1Database,
@@ -1705,64 +1713,64 @@ pub async fn reject_developer_enrollment(
     reason: &str,
     now: i64,
 ) -> Result<Option<DeveloperEnrollment>> {
-    if developer_enrollment(db, enrollment_id).await?.is_none() {
+    let Some(current) = developer_enrollment(db, enrollment_id).await? else {
         return Ok(None);
+    };
+
+    if current.state != "in_review" {
+        return Ok(Some(current));
     }
 
     let metadata = serde_json::to_string(&serde_json::json!({
         "reason": reason,
     }))?;
 
-    let changed = db
-        .prepare(
+    db.batch(vec![
+        db.prepare(
             "UPDATE developer_enrollments
-			SET
-				state = 'rejected',
-				reviewed_at = ?1,
-				updated_at = ?1
-			WHERE id = ?2
-			  AND state = 'in_review'",
+             SET state = 'rejected', reviewed_at = ?1, updated_at = ?1
+             WHERE id = ?2
+               AND state = 'in_review'",
         )
-        .bind(&[number(now), value(enrollment_id)])?
-        .run()
-        .await?
-        .meta()?
-        .and_then(|metadata| metadata.changes)
-        .unwrap_or(0);
-
-    if changed != 0 {
-        db.batch(vec![
-            db.prepare(
-                "INSERT INTO developer_enrollment_events (
-					id,
-					enrollment_id,
-					actor_account_id,
-					event_type,
-					metadata_json,
-					created_at
-				)
-				VALUES (
-					?1,
-					?2,
-					?3,
-					'enrollment.rejected',
-					?4,
-					?5
-				)",
+        .bind(&[
+            number(now),
+            value(enrollment_id),
+        ])?,
+        db.prepare(
+            "INSERT INTO developer_enrollment_events (
+                id,
+                enrollment_id,
+                actor_account_id,
+                event_type,
+                metadata_json,
+                created_at
             )
-            .bind(&[
-                value(id(now)),
-                value(enrollment_id),
-                value(reviewer),
-                value(metadata),
-                number(now),
-            ])?,
-        ])
-        .await?;
-    }
+            SELECT ?1, id, ?2, 'enrollment.rejected', ?3, ?4
+            FROM developer_enrollments
+            WHERE id = ?5
+              AND state = 'rejected'
+              AND updated_at = ?4
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM developer_enrollment_events e
+                  WHERE e.enrollment_id = developer_enrollments.id
+                    AND e.event_type = 'enrollment.rejected'
+                    AND e.created_at = ?4
+              )",
+        )
+        .bind(&[
+            value(id(now)),
+            value(reviewer),
+            value(metadata),
+            number(now),
+            value(enrollment_id),
+        ])?,
+    ])
+    .await?;
 
     developer_enrollment(db, enrollment_id).await
 }
+
 
 pub async fn approve_developer_enrollment(
     db: &D1Database,
