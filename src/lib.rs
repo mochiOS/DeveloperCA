@@ -2369,6 +2369,9 @@ mod tests {
             include_str!("../migrations/0003_automatic_certificate_issuance.sql");
         assert!(automatic_schema.contains("Legacy pending request"));
         assert!(automatic_schema.contains("DROP TABLE developer_package_scopes"));
+        let enrollment_guard =
+            include_str!("../migrations/0013_enrollment_account_guard.sql");
+        assert!(enrollment_guard.contains("account_id TEXT PRIMARY KEY"));
     }
 
     #[test]
