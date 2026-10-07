@@ -66,6 +66,46 @@ fn error(code: &str, message: &str, status: u16) -> Result<Response> {
     )
 }
 
+
+async fn send_notification(
+    db: &D1Database,
+    account_id: &str,
+    kind: &str,
+    title: &str,
+    message: &str,
+    action_url: Option<&str>,
+    source: &str,
+    source_id: Option<&str>,
+) {
+    if let Err(cause) = store::send_notification(
+        db,
+        account_id,
+        kind,
+        title,
+        message,
+        action_url,
+        source,
+        source_id,
+        now(),
+    )
+    .await
+    {
+        console_error!(
+            "notification delivery failed source={} source_id={:?} account={} error={}",
+            source,
+            source_id,
+            account_id,
+            cause
+        );
+    }
+}
+
+fn repeat_enrollment_allowed(env: &Env) -> bool {
+    env.var("ALLOW_REPEAT_ENROLLMENT_FOR_DEBUG")
+        .ok()
+        .is_some_and(|value| value.to_string() == "1")
+}
+
 fn param<'a>(ctx: &'a RouteContext<()>, name: &str) -> &'a str {
     ctx.param(name).map(String::as_str).unwrap_or("")
 }
@@ -1395,7 +1435,7 @@ async fn admin_verification(mut req: Request, ctx: RouteContext<()>) -> Result<R
     )
     .await?;
     store::record_admin_audit(
-        &ctx.env.d1("DB")?,
+        &db,
         Some(param(&ctx, "developer_id")),
         &actor.account_id,
         "admin.developer.verification",
@@ -2517,6 +2557,17 @@ async fn create_developer_enrollment(mut req: Request, ctx: RouteContext<()>) ->
         );
     }
 
+    let db = ctx.env.d1("DB")?;
+    if !repeat_enrollment_allowed(&ctx.env)
+        && store::has_developer_enrollment(&db, &account_id).await?
+    {
+        return error(
+            "ENROLLMENT_ALREADY_EXISTS",
+            "This Account has already submitted a Developer registration",
+            409,
+        );
+    }
+
     let organization_name = input.organization_name.as_deref().map(str::trim);
 
     let organization_type = input.organization_type.as_deref().map(str::trim);
@@ -2539,7 +2590,7 @@ async fn create_developer_enrollment(mut req: Request, ctx: RouteContext<()>) ->
     };
 
     let enrollment = store::create_developer_enrollment(
-        &ctx.env.d1("DB")?,
+        &db,
         store::NewDeveloperEnrollment {
             applicant_account_id: &account_id,
             developer_type: &input.developer_type,
@@ -2773,9 +2824,10 @@ async fn admin_approve_developer_enrollment(
     }
 
     let enrollment_id = param(&ctx, "enrollment_id");
+    let db = ctx.env.d1("DB")?;
 
     let Some(developer) = store::approve_developer_enrollment(
-        &ctx.env.d1("DB")?,
+        &db,
         enrollment_id,
         &actor.account_id,
         now(),
@@ -2798,6 +2850,20 @@ async fn admin_approve_developer_enrollment(
         now(),
     )
     .await?;
+
+    if let Some(enrollment) = store::developer_enrollment(&db, enrollment_id).await? {
+        send_notification(
+            &db,
+            &enrollment.applicant_account_id,
+            "success",
+            "Developer registration approved",
+            "Your Developer registration has been approved.",
+            Some("/console"),
+            "developer_enrollment",
+            Some(enrollment_id),
+        )
+        .await;
+    }
 
     json_response(
         &json!({
@@ -2838,9 +2904,10 @@ async fn admin_reject_developer_enrollment(
     }
 
     let enrollment_id = param(&ctx, "enrollment_id");
+    let db = ctx.env.d1("DB")?;
 
     let Some(enrollment) = store::reject_developer_enrollment(
-        &ctx.env.d1("DB")?,
+        &db,
         enrollment_id,
         &actor.account_id,
         reason,
@@ -2862,6 +2929,18 @@ async fn admin_reject_developer_enrollment(
             409,
         );
     }
+
+    send_notification(
+        &db,
+        &enrollment.applicant_account_id,
+        "warning",
+        "Developer registration was not approved",
+        reason,
+        Some("/console/developers/new"),
+        "developer_enrollment",
+        Some(enrollment_id),
+    )
+    .await;
 
     json_response(
         &json!({
@@ -2900,9 +2979,10 @@ async fn admin_request_developer_enrollment_information(
     }
 
     let enrollment_id = param(&ctx, "enrollment_id");
+    let db = ctx.env.d1("DB")?;
 
     let Some(enrollment) = store::request_developer_enrollment_information(
-        &ctx.env.d1("DB")?,
+        &db,
         enrollment_id,
         &actor.account_id,
         reason,
@@ -2924,6 +3004,18 @@ async fn admin_request_developer_enrollment_information(
             409,
         );
     }
+
+    send_notification(
+        &db,
+        &enrollment.applicant_account_id,
+        "action_required",
+        "Developer registration requires information",
+        reason,
+        Some("/console/developers/new"),
+        "developer_enrollment",
+        Some(enrollment_id),
+    )
+    .await;
 
     json_response(
         &json!({
