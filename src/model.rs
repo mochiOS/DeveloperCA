@@ -192,6 +192,9 @@ pub struct DeveloperEnrollment {
     pub reviewed_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+
+    #[serde(default)]
+    pub last_message_author_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
