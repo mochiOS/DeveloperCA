@@ -2153,6 +2153,10 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             "/v1/developer-enrollments/:enrollment_id",
             get_developer_enrollment,
         )
+        .patch_async(
+            "/v1/developer-enrollments/:enrollment_id",
+            update_developer_enrollment,
+        )
         .post_async(
             "/v1/developer-enrollments/:enrollment_id/messages",
             add_developer_enrollment_message,
@@ -2408,6 +2412,50 @@ fn valid_enrollment_input(input: &CreateDeveloperEnrollment, account_id: &str) -
     }
 }
 
+
+fn valid_enrollment_update(input: &UpdateDeveloperEnrollment, account_id: &str) -> bool {
+    let name = input.display_name.trim();
+    let country = input.country_region.trim();
+    let agreement = input.agreement_version.trim();
+    let message = input.message.trim();
+
+    if !valid_developer_type(&input.developer_type)
+        || name.is_empty()
+        || name.chars().count() > 120
+        || country.is_empty()
+        || country.chars().count() > 80
+        || agreement.is_empty()
+        || agreement.chars().count() > 80
+        || message.is_empty()
+        || message.chars().count() > 4000
+    {
+        return false;
+    }
+
+    match input.developer_type.as_str() {
+        "individual" => {
+            input.organization_type.is_none()
+                && input.organization_name.is_none()
+                && input.account_holder_account_id.is_none()
+        }
+        "organization" => {
+            input
+                .organization_type
+                .as_deref()
+                .is_some_and(valid_organization_type)
+                && input.organization_name.as_deref().is_some_and(|value| {
+                    let value = value.trim();
+                    !value.is_empty() && value.chars().count() <= 120
+                })
+                && input
+                    .account_holder_account_id
+                    .as_deref()
+                    .is_none_or(|value| value == account_id)
+        }
+        _ => false,
+    }
+}
+
 async fn list_developer_enrollments(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Some(account_id) = user(&req, &ctx.env).await? else {
         return error("UNAUTHENTICATED", "Active Accounts session required", 401);
@@ -2614,6 +2662,113 @@ async fn create_developer_enrollment(mut req: Request, ctx: RouteContext<()>) ->
         201,
     )
 }
+async fn update_developer_enrollment(
+    mut req: Request,
+    ctx: RouteContext<()>,
+) -> Result<Response> {
+    let Some(account_id) = user(&req, &ctx.env).await? else {
+        return error("UNAUTHENTICATED", "Active Accounts session required", 401);
+    };
+
+    let input: UpdateDeveloperEnrollment = match req.json().await {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                "ENROLLMENT_INPUT_INVALID",
+                "Developer enrollment input is invalid",
+                400,
+            );
+        }
+    };
+
+    if !valid_enrollment_update(&input, &account_id) {
+        return error(
+            "ENROLLMENT_INPUT_INVALID",
+            "Developer enrollment input is invalid",
+            422,
+        );
+    }
+
+    let enrollment_id = param(&ctx, "enrollment_id");
+    let db = ctx.env.d1("DB")?;
+
+    let Some(current) = store::developer_enrollment(&db, enrollment_id).await? else {
+        return error(
+            "ENROLLMENT_NOT_FOUND",
+            "Developer enrollment not found",
+            404,
+        );
+    };
+
+    if current.applicant_account_id != account_id {
+        return error(
+            "FORBIDDEN",
+            "This enrollment belongs to another Account",
+            403,
+        );
+    }
+
+    if current.state != "information_required" {
+        return error(
+            "ENROLLMENT_STATE_INVALID",
+            "Enrollment can only be edited when more information is required",
+            409,
+        );
+    }
+
+    let organization_name = input.organization_name.as_deref().map(str::trim);
+    let organization_type = input.organization_type.as_deref().map(str::trim);
+    let website = input
+        .website
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let account_holder = if input.developer_type == "organization" {
+        Some(
+            input
+                .account_holder_account_id
+                .as_deref()
+                .unwrap_or(&account_id),
+        )
+    } else {
+        None
+    };
+
+    let enrollment = store::update_developer_enrollment_information(
+        &db,
+        enrollment_id,
+        &account_id,
+        store::DeveloperEnrollmentUpdate {
+            developer_type: &input.developer_type,
+            organization_type,
+            display_legal_name: input.display_name.trim(),
+            organization_name,
+            country_region: input.country_region.trim(),
+            website,
+            account_holder_account_id: account_holder,
+            agreement_version: input.agreement_version.trim(),
+            message: input.message.trim(),
+        },
+        now(),
+    )
+    .await?
+    .ok_or_else(|| {
+        worker::Error::RustError(
+            "developer enrollment disappeared after update".into(),
+        )
+    })?;
+
+    let messages = store::list_developer_enrollment_messages(&db, enrollment_id).await?;
+
+    json_response(
+        &json!({
+            "enrollment": enrollment,
+            "messages": messages,
+        }),
+        200,
+    )
+}
+
 
 async fn submit_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Some(account_id) = user(&req, &ctx.env).await? else {
@@ -2937,7 +3092,7 @@ async fn admin_reject_developer_enrollment(
         "warning",
         "Developer registration was not approved",
         reason,
-        Some("/console/developers/new"),
+        Some("/console/developers/edit"),
         "developer_enrollment",
         Some(enrollment_id),
     )
@@ -3012,7 +3167,7 @@ async fn admin_request_developer_enrollment_information(
         "action_required",
         "Developer registration requires information",
         reason,
-        Some("/console/developers/new"),
+        Some("/console/developers/edit"),
         "developer_enrollment",
         Some(enrollment_id),
     )
