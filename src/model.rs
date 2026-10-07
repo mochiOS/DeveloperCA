@@ -260,6 +260,16 @@ pub struct CreateEnrollmentMessage {
     pub message: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppReviewSubmittedAdminNotification {
+    pub developer_id: String,
+    pub submission_id: String,
+    pub bundle_id: String,
+    pub app_name: String,
+    pub version: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Notification {
     pub id: String,
