@@ -1502,7 +1502,6 @@ async fn admin_review_queue(req: Request, ctx: RouteContext<()>) -> Result<Respo
     }
     let db = ctx.env.d1("DB")?;
     let developers = store::manageable_developers(&db).await?;
-    let developer_creation_requests = store::pending_creation_reviews(&db).await?;
     let rows = store::active_certificates(&db).await?;
     let mut certificates = Vec::with_capacity(rows.len());
     for row in rows {
@@ -1512,7 +1511,6 @@ async fn admin_review_queue(req: Request, ctx: RouteContext<()>) -> Result<Respo
     json_response(
         &json!({
             "developers": developers,
-            "developer_creation_requests": developer_creation_requests,
             "certificates": certificates,
         }),
         200,
@@ -2171,7 +2169,6 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     Router::new()
         .get_async("/health", |_, _| async { health_response() })
         .options_async("/health", |_, _| async { health_preflight() })
-        .post_async("/v1/developers", create_developer)
         .get_async("/v1/developers", list_developers)
         .get_async("/v1/cli/developers", cli_developers)
         .get_async("/v1/developers/:developer_id", get_developer)
@@ -2185,8 +2182,6 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             "/v1/developers/:developer_id/members/:member_id",
             delete_member,
         )
-        .post_async("/v1/developer-creation-requests", create_creation_request)
-        .get_async("/v1/developer-creation-requests", list_creation_requests)
         .post_async(
             "/v1/developers/:developer_id/certificates/issue",
             issue_certificate,
@@ -2234,14 +2229,6 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .post_async("/v1/admin/developers/:developer_id/restore", |req, ctx| {
             admin_set_developer_suspension(req, ctx, false)
         })
-        .post_async(
-            "/v1/admin/developer-creation-requests/:request_id/approve",
-            |req, ctx| admin_creation_review(req, ctx, "approved"),
-        )
-        .post_async(
-            "/v1/admin/developer-creation-requests/:request_id/reject",
-            |req, ctx| admin_creation_review(req, ctx, "rejected"),
-        )
         .post_async(
             "/v1/admin/certificates/:certificate_id/suspend",
             |req, ctx| admin_set_certificate_suspension(req, ctx, true),
@@ -2348,6 +2335,15 @@ mod tests {
         REVOCATION_SNAPSHOT_REFRESH_WINDOW_SECONDS, certificate_issuance_eligible, etag_matches,
         revocation_snapshot_needs_refresh, valid_certificate_display_name,
     };
+
+    #[test]
+    fn legacy_developer_creation_routes_are_not_exposed() {
+        let source = include_str!("lib.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+        assert!(!production.contains(".post_async(\"/v1/developers\", create_developer)"));
+        assert!(!production.contains(".post_async(\"/v1/developer-creation-requests\""));
+        assert!(!production.contains("/v1/admin/developer-creation-requests/:request_id/"));
+    }
 
     #[test]
     fn certificate_display_names_are_required_and_unicode_bounded() {
