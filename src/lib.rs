@@ -2113,9 +2113,19 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             get_developer_enrollment,
         )
         .post_async(
+            "/v1/developer-enrollments/:enrollment_id/messages",
+            add_developer_enrollment_message,
+        )
+        .post_async(
             "/v1/developer-enrollments/:enrollment_id/submit",
             submit_developer_enrollment,
         )
+        .get_async("/v1/notifications", list_notifications)
+        .post_async(
+            "/v1/notifications/:notification_id/read",
+            read_notification,
+        )
+        .post_async("/v1/notifications/read-all", read_all_notifications)
         .get_async(
             "/v1/admin/developer-enrollments",
             admin_list_developer_enrollments,
