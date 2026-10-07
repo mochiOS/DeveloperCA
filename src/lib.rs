@@ -2234,6 +2234,10 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             "/v1/developer-enrollments/:enrollment_id/submit",
             submit_developer_enrollment,
         )
+        .post_async(
+            "/v1/internal/console/admin-notifications/app-review-submitted",
+            notify_app_review_submitted,
+        )
         .get_async("/v1/notifications", list_notifications)
         .post_async(
             "/v1/notifications/:notification_id/read",
@@ -2927,6 +2931,126 @@ async fn submit_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Res
         }),
         200,
     )
+}
+
+async fn notify_app_review_submitted(
+    mut req: Request,
+    ctx: RouteContext<()>,
+) -> Result<Response> {
+    let Some(account_id) = auth::console_account(&req, &ctx.env).await? else {
+        return error(
+            "CONSOLE_AUTH_REQUIRED",
+            "Developer Console authentication required",
+            401,
+        );
+    };
+
+    let input: AppReviewSubmittedAdminNotification = match req.json().await {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                "ADMIN_NOTIFICATION_INPUT_INVALID",
+                "App review notification input is invalid",
+                400,
+            );
+        }
+    };
+
+    let valid_submission_id = input.submission_id.starts_with("sub_")
+        && input.submission_id.len() <= 80
+        && input
+            .submission_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    let valid_bundle_id = !input.bundle_id.is_empty()
+        && input.bundle_id.len() <= 255
+        && input
+            .bundle_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-'))
+        && input.bundle_id.contains('.');
+    let app_name = input.app_name.trim();
+    let version = input.version.trim();
+
+    if !mochios_certificate::is_valid_developer_id(&input.developer_id)
+        || !valid_submission_id
+        || !valid_bundle_id
+        || app_name.is_empty()
+        || app_name.chars().count() > 120
+        || version.is_empty()
+        || version.chars().count() > 64
+    {
+        return error(
+            "ADMIN_NOTIFICATION_INPUT_INVALID",
+            "App review notification input is invalid",
+            422,
+        );
+    }
+
+    let db = ctx.env.d1("DB")?;
+    let Some(member) =
+        store::member_for_account(&db, &input.developer_id, &account_id).await?
+    else {
+        return error(
+            "FORBIDDEN",
+            "Active Developer membership required",
+            403,
+        );
+    };
+
+    if !matches!(member.role.as_str(), "owner" | "admin" | "developer") {
+        return error(
+            "FORBIDDEN",
+            "Developer role cannot submit App review notifications",
+            403,
+        );
+    }
+
+    let Some(developer) = store::developer(&db, &input.developer_id).await? else {
+        return error("DEVELOPER_NOT_FOUND", "Developer not found", 404);
+    };
+
+    if developer.status != "active" || developer.verification_status != "verified" {
+        return error(
+            "DEVELOPER_NOT_ELIGIBLE",
+            "Developer is not active and verified",
+            403,
+        );
+    }
+
+    send_admin_notification(
+        &ctx.env,
+        json!({
+            "kind": "app.review.submitted",
+            "title": "App submitted for review",
+            "description": format!("{} {}", app_name, version),
+            "fields": [
+                {
+                    "name": "Bundle ID",
+                    "value": input.bundle_id,
+                    "inline": false
+                },
+                {
+                    "name": "Developer",
+                    "value": developer.display_name,
+                    "inline": true
+                },
+                {
+                    "name": "Version",
+                    "value": version,
+                    "inline": true
+                },
+                {
+                    "name": "Submission",
+                    "value": input.submission_id,
+                    "inline": false
+                }
+            ]
+        }),
+    )
+    .await;
+
+    Ok(Response::empty()?.with_status(204))
 }
 
 async fn list_notifications(req: Request, ctx: RouteContext<()>) -> Result<Response> {
