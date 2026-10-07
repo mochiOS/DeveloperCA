@@ -2902,6 +2902,14 @@ async fn submit_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Res
                 worker::Error::RustError("developer enrollment disappeared after submission".into())
             })?;
 
+    if enrollment.state != "submitted" {
+        return error(
+            "ENROLLMENT_STATE_CHANGED",
+            "The enrollment state changed while the registration was being submitted",
+            409,
+        );
+    }
+
     send_admin_notification(
         &ctx.env,
         json!({
