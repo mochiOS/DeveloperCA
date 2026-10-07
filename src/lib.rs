@@ -2600,6 +2600,67 @@ async fn submit_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Res
     )
 }
 
+async fn list_notifications(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let Some(account_id) = user(&req, &ctx.env).await? else {
+        return error("UNAUTHENTICATED", "Active Accounts session required", 401);
+    };
+
+    let notifications = store::notifications(&ctx.env.d1("DB")?, &account_id).await?;
+    let unread_count = notifications
+        .iter()
+        .filter(|notification| notification.read_at.is_none())
+        .count();
+
+    json_response(
+        &json!({
+            "notifications": notifications,
+            "unread_count": unread_count,
+        }),
+        200,
+    )
+}
+
+async fn read_notification(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let Some(account_id) = user(&req, &ctx.env).await? else {
+        return error("UNAUTHENTICATED", "Active Accounts session required", 401);
+    };
+
+    let notification_id = param(&ctx, "notification_id");
+    if notification_id.is_empty() || notification_id.len() > 80 {
+        return error(
+            "NOTIFICATION_ID_INVALID",
+            "Notification ID is invalid",
+            422,
+        );
+    }
+
+    if !store::mark_notification_read(
+        &ctx.env.d1("DB")?,
+        notification_id,
+        &account_id,
+        now(),
+    )
+    .await?
+    {
+        return error(
+            "NOTIFICATION_NOT_FOUND",
+            "Notification not found",
+            404,
+        );
+    }
+
+    Ok(Response::empty()?.with_status(204))
+}
+
+async fn read_all_notifications(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let Some(account_id) = user(&req, &ctx.env).await? else {
+        return error("UNAUTHENTICATED", "Active Accounts session required", 401);
+    };
+
+    store::mark_all_notifications_read(&ctx.env.d1("DB")?, &account_id, now()).await?;
+    Ok(Response::empty()?.with_status(204))
+}
+
 async fn admin_list_developer_enrollments(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Some(_actor) = require_admin(&req, &ctx.env).await? else {
         return error("ADMIN_AUTH_REQUIRED", "Admin authentication required", 401);
