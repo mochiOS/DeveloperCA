@@ -1426,8 +1426,9 @@ async fn admin_verification(mut req: Request, ctx: RouteContext<()>) -> Result<R
     if !consume_admin_action(&actor, &ctx.env, "developer.verification").await? {
         return error("ADMIN_TOKEN_REPLAYED", "Admin token was already used", 409);
     }
+    let db = ctx.env.d1("DB")?;
     let developer = store::update_verification(
-        &ctx.env.d1("DB")?,
+        &db,
         param(&ctx, "developer_id"),
         &input.verification_status,
         &actor.account_id,
