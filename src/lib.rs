@@ -3161,13 +3161,17 @@ async fn admin_request_developer_enrollment_information(
         );
     }
 
+    let action_url = format!(
+        "/console/developers/edit?id={}",
+        enrollment_id,
+    );
     send_notification(
         &db,
         &enrollment.applicant_account_id,
         "action_required",
         "Developer registration requires information",
         reason,
-        Some("/console/developers/edit"),
+        Some(&action_url),
         "developer_enrollment",
         Some(enrollment_id),
     )
