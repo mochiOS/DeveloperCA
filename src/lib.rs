@@ -2378,9 +2378,9 @@ async fn get_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Result
     };
 
     let enrollment_id = param(&ctx, "enrollment_id");
+    let db = ctx.env.d1("DB")?;
 
-    let Some(enrollment) = store::developer_enrollment(&ctx.env.d1("DB")?, enrollment_id).await?
-    else {
+    let Some(enrollment) = store::developer_enrollment(&db, enrollment_id).await? else {
         return error(
             "ENROLLMENT_NOT_FOUND",
             "Developer enrollment not found",
@@ -2396,13 +2396,92 @@ async fn get_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Result
         );
     }
 
+    let messages = store::list_developer_enrollment_messages(&db, enrollment_id).await?;
+
     json_response(
         &json!({
             "enrollment": enrollment,
+            "messages": messages,
         }),
         200,
     )
 }
+
+async fn add_developer_enrollment_message(
+    mut req: Request,
+    ctx: RouteContext<()>,
+) -> Result<Response> {
+    let Some(account_id) = user(&req, &ctx.env).await? else {
+        return error("UNAUTHENTICATED", "Active Accounts session required", 401);
+    };
+
+    let input: CreateEnrollmentMessage = match req.json().await {
+        Ok(value) => value,
+        Err(_) => {
+            return error(
+                "ENROLLMENT_MESSAGE_INVALID",
+                "Developer enrollment message is invalid",
+                400,
+            );
+        }
+    };
+
+    let message = input.message.trim();
+    if message.is_empty() || message.chars().count() > 4000 {
+        return error(
+            "ENROLLMENT_MESSAGE_INVALID",
+            "Message must contain 1 to 4000 characters",
+            422,
+        );
+    }
+
+    let enrollment_id = param(&ctx, "enrollment_id");
+    let db = ctx.env.d1("DB")?;
+
+    let Some(enrollment) = store::developer_enrollment(&db, enrollment_id).await? else {
+        return error(
+            "ENROLLMENT_NOT_FOUND",
+            "Developer enrollment not found",
+            404,
+        );
+    };
+
+    if enrollment.applicant_account_id != account_id {
+        return error(
+            "FORBIDDEN",
+            "This enrollment belongs to another Account",
+            403,
+        );
+    }
+
+    if enrollment.state != "information_required" {
+        return error(
+            "ENROLLMENT_STATE_INVALID",
+            "Messages can only be sent when more information is required",
+            409,
+        );
+    }
+
+    if !store::add_developer_enrollment_message(
+        &db,
+        enrollment_id,
+        &account_id,
+        message,
+        now(),
+    )
+    .await?
+    {
+        return error(
+            "ENROLLMENT_MESSAGE_NOT_SAVED",
+            "Developer enrollment message could not be saved",
+            409,
+        );
+    }
+
+    let messages = store::list_developer_enrollment_messages(&db, enrollment_id).await?;
+    json_response(&json!({"messages": messages}), 201)
+}
+
 
 async fn create_developer_enrollment(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Some(account_id) = user(&req, &ctx.env).await? else {
