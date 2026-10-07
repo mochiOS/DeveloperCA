@@ -1285,6 +1285,19 @@ pub struct NewDeveloperEnrollment<'a> {
     pub agreement_version: &'a str,
 }
 
+
+pub struct DeveloperEnrollmentUpdate<'a> {
+    pub developer_type: &'a str,
+    pub organization_type: Option<&'a str>,
+    pub display_legal_name: &'a str,
+    pub organization_name: Option<&'a str>,
+    pub country_region: &'a str,
+    pub website: Option<&'a str>,
+    pub account_holder_account_id: Option<&'a str>,
+    pub agreement_version: &'a str,
+    pub message: &'a str,
+}
+
 pub async fn create_developer_enrollment(
     db: &D1Database,
     input: NewDeveloperEnrollment<'_>,
@@ -1357,6 +1370,100 @@ pub async fn create_developer_enrollment(
         .ok_or_else(|| {
             worker::Error::RustError("developer enrollment disappeared after creation".into())
         })
+}
+
+pub async fn update_developer_enrollment_information(
+    db: &D1Database,
+    enrollment_id: &str,
+    account_id: &str,
+    input: DeveloperEnrollmentUpdate<'_>,
+    now: i64,
+) -> Result<Option<DeveloperEnrollment>> {
+    let changed = db
+        .prepare(
+            "UPDATE developer_enrollments
+             SET
+                developer_type = ?1,
+                organization_type = ?2,
+                display_legal_name = ?3,
+                organization_name = ?4,
+                country_region = ?5,
+                website = ?6,
+                account_holder_account_id = ?7,
+                agreement_version = ?8,
+                updated_at = ?9
+             WHERE id = ?10
+               AND applicant_account_id = ?11
+               AND state = 'information_required'",
+        )
+        .bind(&[
+            value(input.developer_type),
+            nullable(input.organization_type),
+            value(input.display_legal_name),
+            nullable(input.organization_name),
+            value(input.country_region),
+            nullable(input.website),
+            nullable(input.account_holder_account_id),
+            value(input.agreement_version),
+            number(now),
+            value(enrollment_id),
+            value(account_id),
+        ])?
+        .run()
+        .await?
+        .meta()?
+        .and_then(|metadata| metadata.changes)
+        .unwrap_or(0);
+
+    if changed == 0 {
+        return developer_enrollment(db, enrollment_id).await;
+    }
+
+    db.batch(vec![
+        db.prepare(
+            "INSERT INTO developer_enrollment_messages (
+                id,
+                enrollment_id,
+                author_account_id,
+                author_kind,
+                message,
+                created_at
+            ) VALUES (?1, ?2, ?3, 'developer', ?4, ?5)",
+        )
+        .bind(&[
+            value(id(now)),
+            value(enrollment_id),
+            value(account_id),
+            value(input.message),
+            number(now),
+        ])?,
+        db.prepare(
+            "INSERT INTO developer_enrollment_events (
+                id,
+                enrollment_id,
+                actor_account_id,
+                event_type,
+                metadata_json,
+                created_at
+            ) VALUES (
+                ?1,
+                ?2,
+                ?3,
+                'enrollment.information_updated',
+                '{}',
+                ?4
+            )",
+        )
+        .bind(&[
+            value(id(now)),
+            value(enrollment_id),
+            value(account_id),
+            number(now),
+        ])?,
+    ])
+    .await?;
+
+    developer_enrollment(db, enrollment_id).await
 }
 
 pub async fn submit_developer_enrollment(
