@@ -1187,6 +1187,23 @@ pub async fn developer_enrollment(
     .await
 }
 
+pub async fn has_developer_enrollment(
+    db: &D1Database,
+    account_id: &str,
+) -> Result<bool> {
+    Ok(db
+        .prepare(
+            "SELECT id
+             FROM developer_enrollments
+             WHERE applicant_account_id = ?1
+             LIMIT 1",
+        )
+        .bind(&[value(account_id)])?
+        .first::<serde_json::Value>(None)
+        .await?
+        .is_some())
+}
+
 pub async fn list_developer_enrollments(
     db: &D1Database,
     account_id: &str,
@@ -1241,13 +1258,15 @@ pub async fn list_reviewable_developer_enrollments(
 			WHERE state IN (
 				'submitted',
 				'in_review',
-				'information_required'
+				'information_required',
+				'rejected'
 			)
 			ORDER BY
 				CASE state
 					WHEN 'submitted' THEN 0
 					WHEN 'in_review' THEN 1
-					ELSE 2
+					WHEN 'information_required' THEN 2
+					ELSE 3
 				END,
 				submitted_at ASC",
     ))
