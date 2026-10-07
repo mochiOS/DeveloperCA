@@ -2568,14 +2568,6 @@ async fn get_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Result
         );
     }
 
-    if enrollment.state != "submitted" {
-        return error(
-            "ENROLLMENT_STATE_CHANGED",
-            "The enrollment state changed while updated information was being sent",
-            409,
-        );
-    }
-
     let messages = store::list_developer_enrollment_messages(&db, enrollment_id).await?;
 
     json_response(
@@ -2847,6 +2839,14 @@ async fn update_developer_enrollment(
             "developer enrollment disappeared after update".into(),
         )
     })?;
+
+    if enrollment.state != "submitted" {
+        return error(
+            "ENROLLMENT_STATE_CHANGED",
+            "The enrollment state changed while updated information was being sent",
+            409,
+        );
+    }
 
     let messages = store::list_developer_enrollment_messages(&db, enrollment_id).await?;
 
