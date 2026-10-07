@@ -1464,9 +1464,9 @@ pub async fn request_developer_enrollment_information(
     reason: &str,
     now: i64,
 ) -> Result<Option<DeveloperEnrollment>> {
-    let Some(current) = developer_enrollment(db, enrollment_id).await? else {
+    if developer_enrollment(db, enrollment_id).await?.is_none() {
         return Ok(None);
-    };
+    }
 
     let metadata = serde_json::to_string(&serde_json::json!({
         "reason": reason,
@@ -1548,9 +1548,9 @@ pub async fn reject_developer_enrollment(
     reason: &str,
     now: i64,
 ) -> Result<Option<DeveloperEnrollment>> {
-    let Some(current) = developer_enrollment(db, enrollment_id).await? else {
+    if developer_enrollment(db, enrollment_id).await?.is_none() {
         return Ok(None);
-    };
+    }
 
     let metadata = serde_json::to_string(&serde_json::json!({
         "reason": reason,
