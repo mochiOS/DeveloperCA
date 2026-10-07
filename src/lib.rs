@@ -2680,15 +2680,7 @@ async fn create_developer_enrollment(mut req: Request, ctx: RouteContext<()>) ->
     }
 
     let db = ctx.env.d1("DB")?;
-    if !repeat_enrollment_allowed(&ctx.env)
-        && store::has_developer_enrollment(&db, &account_id).await?
-    {
-        return error(
-            "ENROLLMENT_ALREADY_EXISTS",
-            "This Account has already submitted a Developer registration",
-            409,
-        );
-    }
+    let enforce_single_account = !repeat_enrollment_allowed(&ctx.env);
 
     let organization_name = input.organization_name.as_deref().map(str::trim);
 
@@ -2711,7 +2703,7 @@ async fn create_developer_enrollment(mut req: Request, ctx: RouteContext<()>) ->
         None
     };
 
-    let enrollment = store::create_developer_enrollment(
+    let enrollment = match store::create_developer_enrollment(
         &db,
         store::NewDeveloperEnrollment {
             applicant_account_id: &account_id,
@@ -2725,8 +2717,25 @@ async fn create_developer_enrollment(mut req: Request, ctx: RouteContext<()>) ->
             agreement_version: input.agreement_version.trim(),
         },
         now(),
+        enforce_single_account,
     )
-    .await?;
+    .await
+    {
+        Ok(enrollment) => enrollment,
+        Err(cause)
+            if enforce_single_account
+                && store::has_developer_enrollment(&db, &account_id)
+                    .await
+                    .unwrap_or(false) =>
+        {
+            return error(
+                "ENROLLMENT_ALREADY_EXISTS",
+                "This Account has already submitted a Developer registration",
+                409,
+            );
+        }
+        Err(cause) => return Err(cause),
+    };
 
     json_response(
         &json!({
