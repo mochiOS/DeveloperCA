@@ -216,6 +216,24 @@ pub struct EnrollmentDecisionInput {
     pub reason: Option<String>,
 }
 
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateDeveloperEnrollment {
+    pub developer_type: String,
+
+    #[serde(alias = "display_legal_name")]
+    pub display_name: String,
+
+    pub organization_type: Option<String>,
+    pub organization_name: Option<String>,
+    pub country_region: String,
+    pub website: Option<String>,
+    pub account_holder_account_id: Option<String>,
+    pub agreement_version: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeveloperEnrollmentEvent {
     pub id: String,
