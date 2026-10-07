@@ -241,3 +241,17 @@ pub struct DeveloperEnrollmentMessage {
 pub struct CreateEnrollmentMessage {
     pub message: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Notification {
+    pub id: String,
+    pub account_id: String,
+    pub kind: String,
+    pub title: String,
+    pub message: String,
+    pub action_url: Option<String>,
+    pub source: String,
+    pub source_id: Option<String>,
+    pub created_at: i64,
+    pub read_at: Option<i64>,
+}
