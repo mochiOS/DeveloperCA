@@ -100,6 +100,77 @@ async fn send_notification(
     }
 }
 
+
+async fn send_admin_notification(env: &Env, payload: serde_json::Value) {
+    let token = match env
+        .secret_store("ADMIN_NOTIFICATION_SERVICE_TOKEN")
+        .and_then(|binding| Ok(binding))
+    {
+        Ok(binding) => match binding.get().await {
+            Ok(Some(value)) if !value.is_empty() => value,
+            Ok(_) => {
+                console_error!("admin notification token is unavailable");
+                return;
+            }
+            Err(error) => {
+                console_error!("admin notification token lookup failed: {}", error);
+                return;
+            }
+        },
+        Err(error) => {
+            console_error!("admin notification token binding is unavailable: {}", error);
+            return;
+        }
+    };
+
+    let headers = Headers::new();
+    if headers.set("Accept", "application/json").is_err()
+        || headers.set("Content-Type", "application/json").is_err()
+        || headers
+            .set("X-Admin-Notification-Token", &token)
+            .is_err()
+    {
+        console_error!("admin notification headers could not be created");
+        return;
+    }
+
+    let body = match serde_json::to_string(&payload) {
+        Ok(value) => value,
+        Err(error) => {
+            console_error!("admin notification payload serialization failed: {}", error);
+            return;
+        }
+    };
+
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(wasm_bindgen::JsValue::from_str(&body)));
+
+    let request = match Request::new_with_init(
+        "https://admin.internal/api/internal/admin-notifications",
+        &init,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            console_error!("admin notification request could not be created: {}", error);
+            return;
+        }
+    };
+
+    match env.service("ADMIN_DASHBOARD") {
+        Ok(service) => match service.fetch_request(request).await {
+            Ok(response) if (200..300).contains(&response.status_code()) => {}
+            Ok(response) => console_error!(
+                "admin notification delivery returned HTTP {}",
+                response.status_code()
+            ),
+            Err(error) => console_error!("admin notification delivery failed: {}", error),
+        },
+        Err(error) => console_error!("admin notification service binding is unavailable: {}", error),
+    }
+}
+
 fn repeat_enrollment_allowed(env: &Env) -> bool {
     env.var("ALLOW_REPEAT_ENROLLMENT_FOR_DEBUG")
         .ok()
@@ -2808,6 +2879,49 @@ async fn submit_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Res
             .ok_or_else(|| {
                 worker::Error::RustError("developer enrollment disappeared after submission".into())
             })?;
+
+    send_admin_notification(
+        &ctx.env,
+        json!({
+            "kind": "developer.enrollment.submitted",
+            "title": "Developer registration submitted",
+            "description": enrollment
+                .organization_name
+                .as_deref()
+                .unwrap_or(&enrollment.display_legal_name),
+            "fields": [
+                {
+                    "name": "Type",
+                    "value": if enrollment.developer_type == "organization" {
+                        "Organization"
+                    } else {
+                        "Individual"
+                    },
+                    "inline": true
+                },
+                {
+                    "name": "Country / region",
+                    "value": enrollment.country_region,
+                    "inline": true
+                },
+                {
+                    "name": "Account",
+                    "value": enrollment.applicant_account_id,
+                    "inline": false
+                },
+                {
+                    "name": "Application",
+                    "value": enrollment.id,
+                    "inline": false
+                }
+            ],
+            "action_path": format!(
+                "/developers/enrollments/{}",
+                enrollment.id
+            )
+        }),
+    )
+    .await;
 
     json_response(
         &json!({
