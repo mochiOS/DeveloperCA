@@ -1571,79 +1571,90 @@ pub async fn request_developer_enrollment_information(
     reason: &str,
     now: i64,
 ) -> Result<Option<DeveloperEnrollment>> {
-    if developer_enrollment(db, enrollment_id).await?.is_none() {
+    let Some(current) = developer_enrollment(db, enrollment_id).await? else {
         return Ok(None);
+    };
+
+    if current.state != "in_review" {
+        return Ok(Some(current));
     }
 
     let metadata = serde_json::to_string(&serde_json::json!({
         "reason": reason,
     }))?;
 
-    let changed = db
-        .prepare(
+    db.batch(vec![
+        db.prepare(
             "UPDATE developer_enrollments
-			SET
-				state = 'information_required',
-				reviewed_at = ?1,
-				updated_at = ?1
-			WHERE id = ?2
-			  AND state = 'in_review'",
+             SET
+                state = 'information_required',
+                reviewed_at = ?1,
+                updated_at = ?1
+             WHERE id = ?2
+               AND state = 'in_review'",
         )
-        .bind(&[number(now), value(enrollment_id)])?
-        .run()
-        .await?
-        .meta()?
-        .and_then(|metadata| metadata.changes)
-        .unwrap_or(0);
-
-    if changed != 0 {
-        db.batch(vec![
-            db.prepare(
-                "INSERT INTO developer_enrollment_events (
-					id,
-					enrollment_id,
-					actor_account_id,
-					event_type,
-					metadata_json,
-					created_at
-				)
-				VALUES (
-					?1,
-					?2,
-					?3,
-					'enrollment.information_required',
-					?4,
-					?5
-				)",
+        .bind(&[
+            number(now),
+            value(enrollment_id),
+        ])?,
+        db.prepare(
+            "INSERT INTO developer_enrollment_events (
+                id,
+                enrollment_id,
+                actor_account_id,
+                event_type,
+                metadata_json,
+                created_at
             )
-            .bind(&[
-                value(id(now)),
-                value(enrollment_id),
-                value(reviewer),
-                value(metadata),
-                number(now),
-            ])?,
-            db.prepare(
-                "INSERT INTO developer_enrollment_messages (
-					id,
-					enrollment_id,
-					author_account_id,
-					author_kind,
-					message,
-					created_at
-				)
-				VALUES (?1, ?2, ?3, 'reviewer', ?4, ?5)",
+            SELECT
+                ?1,
+                id,
+                ?2,
+                'enrollment.information_required',
+                ?3,
+                ?4
+            FROM developer_enrollments
+            WHERE id = ?5
+              AND state = 'information_required'
+              AND updated_at = ?4",
+        )
+        .bind(&[
+            value(id(now)),
+            value(reviewer),
+            value(metadata),
+            number(now),
+            value(enrollment_id),
+        ])?,
+        db.prepare(
+            "INSERT INTO developer_enrollment_messages (
+                id,
+                enrollment_id,
+                author_account_id,
+                author_kind,
+                message,
+                created_at
             )
-            .bind(&[
-                value(id(now)),
-                value(enrollment_id),
-                value(reviewer),
-                value(reason),
-                number(now),
-            ])?,
-        ])
-        .await?;
-    }
+            SELECT
+                ?1,
+                id,
+                ?2,
+                'reviewer',
+                ?3,
+                ?4
+            FROM developer_enrollments
+            WHERE id = ?5
+              AND state = 'information_required'
+              AND updated_at = ?4",
+        )
+        .bind(&[
+            value(id(now)),
+            value(reviewer),
+            value(reason),
+            number(now),
+            value(enrollment_id),
+        ])?,
+    ])
+    .await?;
 
     developer_enrollment(db, enrollment_id).await
 }
