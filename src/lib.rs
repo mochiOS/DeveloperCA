@@ -38,6 +38,25 @@ fn json_response<T: Serialize>(value: &T, status: u16) -> Result<Response> {
     Ok(Response::from_json(value)?.with_status(status))
 }
 
+
+async fn public_rate_limited(req: &Request, env: &Env, scope: &str) -> Result<Option<Response>> {
+    let Some(client) = req.headers().get("CF-Connecting-IP")? else {
+        return Ok(None);
+    };
+    if env
+        .rate_limiter("PUBLIC_RATE_LIMITER")?
+        .limit(format!("{scope}:{client}"))
+        .await?
+        .success
+    {
+        return Ok(None);
+    }
+
+    let mut response = error("RATE_LIMITED", "Too many requests", 429)?;
+    response.headers_mut().set("Retry-After", "60")?;
+    Ok(Some(response))
+}
+
 fn with_health_cors(mut response: Response) -> Result<Response> {
     let headers = response.headers_mut();
     headers.set("Access-Control-Allow-Origin", STATUS_ORIGIN)?;
@@ -945,6 +964,10 @@ fn etag_matches(header: &str, quoted_etag: &str) -> bool {
 }
 
 async fn trust_store(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    if let Some(response) = public_rate_limited(&req, &ctx.env, "trust-store").await? {
+        return Ok(response);
+    }
+
     let Some(snapshot) = store::current_trust_snapshot(&ctx.env.d1("DB")?).await? else {
         return error(
             "TRUST_SNAPSHOT_UNAVAILABLE",
@@ -961,6 +984,10 @@ async fn trust_store(req: Request, ctx: RouteContext<()>) -> Result<Response> {
 }
 
 async fn trust_store_version(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    if let Some(response) = public_rate_limited(&req, &ctx.env, "trust-store-version").await? {
+        return Ok(response);
+    }
+
     let version = match param(&ctx, "snapshot_version").parse::<i64>() {
         Ok(version) if version > 0 => version,
         _ => {
@@ -983,6 +1010,10 @@ async fn trust_store_version(req: Request, ctx: RouteContext<()>) -> Result<Resp
 }
 
 async fn revocations(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    if let Some(response) = public_rate_limited(&req, &ctx.env, "revocations").await? {
+        return Ok(response);
+    }
+
     let Some(snapshot) = store::current_revocation_snapshot(&ctx.env.d1("DB")?).await? else {
         return error(
             "REVOCATION_SNAPSHOT_UNAVAILABLE",
@@ -999,6 +1030,10 @@ async fn revocations(req: Request, ctx: RouteContext<()>) -> Result<Response> {
 }
 
 async fn revocations_version(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    if let Some(response) = public_rate_limited(&req, &ctx.env, "revocations-version").await? {
+        return Ok(response);
+    }
+
     let version = match param(&ctx, "snapshot_version").parse::<i64>() {
         Ok(version) if version > 0 => version,
         _ => {
@@ -1024,7 +1059,10 @@ async fn revocations_version(req: Request, ctx: RouteContext<()>) -> Result<Resp
     )
 }
 
-async fn certificate_status(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
+async fn certificate_status(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    if let Some(response) = public_rate_limited(&req, &ctx.env, "certificate-status").await? {
+        return Ok(response);
+    }
     let certificate_id = param(&ctx, "certificate_id");
     let Some(row) = store::certificate(&ctx.env.d1("DB")?, certificate_id).await? else {
         return error("CERTIFICATE_NOT_FOUND", "Certificate not found", 404);
