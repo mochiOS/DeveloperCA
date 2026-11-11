@@ -1372,6 +1372,38 @@ pub async fn create_developer_enrollment(
         })
 }
 
+// Called after the guarded event insert, in the same D1 batch as the application change.
+fn enrollment_admin_notification(
+    db: &D1Database,
+    enrollment_id: &str,
+    reply: bool,
+    now: i64,
+) -> Result<worker::D1PreparedStatement> {
+    db.prepare(
+        "INSERT INTO admin_notification_outbox (id, payload_json, next_attempt_at)
+         SELECT ?1, json_object(
+             'event_id', ?1, 'kind', ?2, 'title', ?3,
+             'description', COALESCE(NULLIF(organization_name, ''), display_legal_name),
+             'action_path', '/developers/enrollments/' || id
+         ), ?4 FROM developer_enrollments WHERE id = ?5 AND changes() = 1",
+    )
+    .bind(&[
+        value(id(now)),
+        value(if reply {
+            "developer.enrollment.replied"
+        } else {
+            "developer.enrollment.submitted"
+        }),
+        value(if reply {
+            "Developer registration reply received"
+        } else {
+            "Developer registration submitted"
+        }),
+        number(now),
+        value(enrollment_id),
+    ])
+}
+
 pub async fn update_developer_enrollment_information(
     db: &D1Database,
     enrollment_id: &str,
@@ -1450,6 +1482,7 @@ pub async fn update_developer_enrollment_information(
                 value(account_id),
                 number(now),
             ])?,
+            enrollment_admin_notification(db, enrollment_id, true, now)?,
         ])
         .await?;
 
@@ -1500,6 +1533,7 @@ pub async fn submit_developer_enrollment(
                 value(account_id),
                 number(now),
             ])?,
+            enrollment_admin_notification(db, enrollment_id, false, now)?,
         ])
         .await?;
 
@@ -1963,6 +1997,7 @@ pub async fn add_developer_enrollment_message(
                 value(account_id),
                 number(now),
             ])?,
+            enrollment_admin_notification(db, enrollment_id, true, now)?,
         ])
         .await?;
 

@@ -1,3 +1,4 @@
+mod admin_notifications;
 mod auth;
 pub mod certificate;
 mod model;
@@ -101,73 +102,6 @@ async fn send_notification(
 }
 
 
-async fn send_admin_notification(env: &Env, payload: serde_json::Value) {
-    let token_binding = match env.secret_store("ADMIN_NOTIFICATION_SERVICE_TOKEN") {
-        Ok(binding) => binding,
-        Err(error) => {
-            console_error!("admin notification token binding is unavailable: {}", error);
-            return;
-        }
-    };
-    let token = match token_binding.get().await {
-        Ok(Some(value)) if !value.is_empty() => value,
-        Ok(_) => {
-            console_error!("admin notification token is unavailable");
-            return;
-        }
-        Err(error) => {
-            console_error!("admin notification token lookup failed: {}", error);
-            return;
-        }
-    };
-
-    let headers = Headers::new();
-    if headers.set("Accept", "application/json").is_err()
-        || headers.set("Content-Type", "application/json").is_err()
-        || headers
-            .set("X-Admin-Notification-Token", &token)
-            .is_err()
-    {
-        console_error!("admin notification headers could not be created");
-        return;
-    }
-
-    let body = match serde_json::to_string(&payload) {
-        Ok(value) => value,
-        Err(error) => {
-            console_error!("admin notification payload serialization failed: {}", error);
-            return;
-        }
-    };
-
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post)
-        .with_headers(headers)
-        .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&body)));
-
-    let request = match Request::new_with_init(
-        "https://admin.internal/api/internal/admin-notifications",
-        &init,
-    ) {
-        Ok(request) => request,
-        Err(error) => {
-            console_error!("admin notification request could not be created: {}", error);
-            return;
-        }
-    };
-
-    match env.service("ADMIN_DASHBOARD") {
-        Ok(service) => match service.fetch_request(request).await {
-            Ok(response) if (200..300).contains(&response.status_code()) => {}
-            Ok(response) => console_error!(
-                "admin notification delivery returned HTTP {}",
-                response.status_code()
-            ),
-            Err(error) => console_error!("admin notification delivery failed: {}", error),
-        },
-        Err(error) => console_error!("admin notification service binding is unavailable: {}", error),
-    }
-}
 
 fn repeat_enrollment_allowed(env: &Env) -> bool {
     env.var("ALLOW_REPEAT_ENROLLMENT_FOR_DEBUG")
@@ -2129,8 +2063,12 @@ async fn admin_revoke(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
 }
 
 #[event(fetch)]
-pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    Router::new()
+pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    let notify = matches!(req.method(), Method::Post | Method::Patch)
+        && (req.path().starts_with("/v1/developer-enrollments/")
+            || req.path() == "/v1/internal/console/admin-notifications/app-review-submitted");
+    let notification_env = env.clone();
+    let response = Router::new()
         .get_async("/health", |_, _| async { health_response() })
         .options_async("/health", |_, _| async { health_preflight() })
         .post_async("/v1/developers", create_developer)
@@ -2239,10 +2177,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             notify_app_review_submitted,
         )
         .get_async("/v1/notifications", list_notifications)
-        .post_async(
-            "/v1/notifications/:notification_id/read",
-            read_notification,
-        )
+        .post_async("/v1/notifications/:notification_id/read", read_notification)
         .post_async("/v1/notifications/read-all", read_all_notifications)
         .get_async(
             "/v1/admin/developer-enrollments",
@@ -2269,7 +2204,19 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             admin_request_developer_enrollment_information,
         )
         .run(req, env)
-        .await
+        .await;
+    if notify
+        && response
+            .as_ref()
+            .is_ok_and(|value| (200..300).contains(&value.status_code()))
+    {
+        ctx.wait_until(async move {
+            if let Err(error) = admin_notifications::drain(&notification_env).await {
+                console_error!("admin notification retry pending: {}", error);
+            }
+        });
+    }
+    response
 }
 
 #[event(scheduled)]
@@ -2301,6 +2248,10 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
                 "error": error.to_string()
             })
         ),
+    }
+    // Keep the existing trust-snapshot refresh ahead of optional Discord delivery.
+    if let Err(error) = admin_notifications::drain(&env).await {
+        console_error!("admin notification scheduled retry failed: {}", error);
     }
 }
 
@@ -2884,49 +2835,6 @@ async fn submit_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Res
         );
     };
 
-    send_admin_notification(
-        &ctx.env,
-        json!({
-            "kind": "developer.enrollment.submitted",
-            "title": "Developer registration submitted",
-            "description": enrollment
-                .organization_name
-                .as_deref()
-                .unwrap_or(&enrollment.display_legal_name),
-            "fields": [
-                {
-                    "name": "Type",
-                    "value": if enrollment.developer_type == "organization" {
-                        "Organization"
-                    } else {
-                        "Individual"
-                    },
-                    "inline": true
-                },
-                {
-                    "name": "Country / region",
-                    "value": enrollment.country_region,
-                    "inline": true
-                },
-                {
-                    "name": "Account",
-                    "value": enrollment.applicant_account_id,
-                    "inline": false
-                },
-                {
-                    "name": "Application",
-                    "value": enrollment.id,
-                    "inline": false
-                }
-            ],
-            "action_path": format!(
-                "/developers/enrollments/{}",
-                enrollment.id
-            )
-        }),
-    )
-    .await;
-
     json_response(
         &json!({
             "enrollment": enrollment,
@@ -2935,10 +2843,7 @@ async fn submit_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Res
     )
 }
 
-async fn notify_app_review_submitted(
-    mut req: Request,
-    ctx: RouteContext<()>,
-) -> Result<Response> {
+async fn notify_app_review_submitted(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Some(account_id) = auth::console_account(&req, &ctx.env).await? else {
         return error(
             "CONSOLE_AUTH_REQUIRED",
@@ -2966,10 +2871,9 @@ async fn notify_app_review_submitted(
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
     let valid_bundle_id = !input.bundle_id.is_empty()
         && input.bundle_id.len() <= 255
-        && input
-            .bundle_id
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-'))
+        && input.bundle_id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+        })
         && input.bundle_id.contains('.');
     let app_name = input.app_name.trim();
     let version = input.version.trim();
@@ -2990,14 +2894,9 @@ async fn notify_app_review_submitted(
     }
 
     let db = ctx.env.d1("DB")?;
-    let Some(member) =
-        store::member_for_account(&db, &input.developer_id, &account_id).await?
+    let Some(member) = store::member_for_account(&db, &input.developer_id, &account_id).await?
     else {
-        return error(
-            "FORBIDDEN",
-            "Active Developer membership required",
-            403,
-        );
+        return error("FORBIDDEN", "Active Developer membership required", 403);
     };
 
     if !matches!(member.role.as_str(), "owner" | "admin" | "developer") {
@@ -3020,8 +2919,9 @@ async fn notify_app_review_submitted(
         );
     }
 
-    send_admin_notification(
+    admin_notifications::enqueue(
         &ctx.env,
+        &format!("app-review:{}", input.submission_id),
         json!({
             "kind": "app.review.submitted",
             "title": "App submitted for review",
@@ -3050,7 +2950,7 @@ async fn notify_app_review_submitted(
             ]
         }),
     )
-    .await;
+    .await?;
 
     Ok(Response::empty()?.with_status(204))
 }
