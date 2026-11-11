@@ -3,7 +3,7 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2026-07-26"
 
 [build]
-command = "worker-build --release --no-panic-recovery"
+command = "worker-build --release"
 
 [vars]
 ACCOUNTS_BASE_URL = "https://accounts.mochios.org"

@@ -28,4 +28,4 @@ rusqlite = { version = "0.38", features = ["bundled"] }
 codegen-units = 1
 lto = true
 opt-level = "s"
-strip = true
+strip = "debuginfo"
