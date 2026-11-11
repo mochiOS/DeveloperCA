@@ -2735,10 +2735,7 @@ async fn create_developer_enrollment(mut req: Request, ctx: RouteContext<()>) ->
         201,
     )
 }
-async fn update_developer_enrollment(
-    mut req: Request,
-    ctx: RouteContext<()>,
-) -> Result<Response> {
+async fn update_developer_enrollment(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Some(account_id) = user(&req, &ctx.env).await? else {
         return error("UNAUTHENTICATED", "Active Accounts session required", 401);
     };
@@ -2807,7 +2804,7 @@ async fn update_developer_enrollment(
         None
     };
 
-    let enrollment = store::update_developer_enrollment_information(
+    let Some(enrollment) = store::update_developer_enrollment_information(
         &db,
         enrollment_id,
         &account_id,
@@ -2825,11 +2822,13 @@ async fn update_developer_enrollment(
         now(),
     )
     .await?
-    .ok_or_else(|| {
-        worker::Error::RustError(
-            "developer enrollment disappeared after update".into(),
-        )
-    })?;
+    else {
+        return error(
+            "ENROLLMENT_STATE_INVALID",
+            "Enrollment is no longer requesting information",
+            409,
+        );
+    };
 
     let messages = store::list_developer_enrollment_messages(&db, enrollment_id).await?;
 
@@ -2841,7 +2840,6 @@ async fn update_developer_enrollment(
         200,
     )
 }
-
 
 async fn submit_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Some(account_id) = user(&req, &ctx.env).await? else {
@@ -2875,12 +2873,16 @@ async fn submit_developer_enrollment(req: Request, ctx: RouteContext<()>) -> Res
         );
     }
 
-    let enrollment =
+    let Some(enrollment) =
         store::submit_developer_enrollment(&ctx.env.d1("DB")?, enrollment_id, &account_id, now())
             .await?
-            .ok_or_else(|| {
-                worker::Error::RustError("developer enrollment disappeared after submission".into())
-            })?;
+    else {
+        return error(
+            "ENROLLMENT_STATE_INVALID",
+            "Enrollment is no longer a draft",
+            409,
+        );
+    };
 
     send_admin_notification(
         &ctx.env,
@@ -3181,9 +3183,9 @@ async fn admin_begin_developer_enrollment_review(
     .await?
     else {
         return error(
-            "ENROLLMENT_NOT_FOUND",
-            "Developer enrollment not found",
-            404,
+            "ENROLLMENT_STATE_INVALID",
+            "Enrollment is missing or its review state has changed",
+            409,
         );
     };
 
@@ -3218,13 +3220,8 @@ async fn admin_approve_developer_enrollment(
     let enrollment_id = param(&ctx, "enrollment_id");
     let db = ctx.env.d1("DB")?;
 
-    let Some(developer) = store::approve_developer_enrollment(
-        &db,
-        enrollment_id,
-        &actor.account_id,
-        now(),
-    )
-    .await?
+    let Some(developer) =
+        store::approve_developer_enrollment(&db, enrollment_id, &actor.account_id, now()).await?
     else {
         return error(
             "ENROLLMENT_STATE_INVALID",
@@ -3282,11 +3279,11 @@ async fn admin_reject_developer_enrollment(
         .reason
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty() && value.chars().count() <= 4000)
     else {
         return error(
             "REJECTION_REASON_REQUIRED",
-            "Rejection reason required",
+            "Rejection reason must contain 1–4000 characters",
             422,
         );
     };
@@ -3298,19 +3295,14 @@ async fn admin_reject_developer_enrollment(
     let enrollment_id = param(&ctx, "enrollment_id");
     let db = ctx.env.d1("DB")?;
 
-    let Some(enrollment) = store::reject_developer_enrollment(
-        &db,
-        enrollment_id,
-        &actor.account_id,
-        reason,
-        now(),
-    )
-    .await?
+    let Some(enrollment) =
+        store::reject_developer_enrollment(&db, enrollment_id, &actor.account_id, reason, now())
+            .await?
     else {
         return error(
-            "ENROLLMENT_NOT_FOUND",
-            "Developer enrollment not found",
-            404,
+            "ENROLLMENT_STATE_INVALID",
+            "Enrollment is missing or its review state has changed",
+            409,
         );
     };
 
@@ -3361,9 +3353,13 @@ async fn admin_request_developer_enrollment_information(
         .reason
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty() && value.chars().count() <= 4000)
     else {
-        return error("REASON_REQUIRED", "A reason is required", 422);
+        return error(
+            "REASON_REQUIRED",
+            "A reason of 1–4000 characters is required",
+            422,
+        );
     };
 
     if !consume_admin_action(&actor, &ctx.env, "developer_enrollment.request_information").await? {
@@ -3383,9 +3379,9 @@ async fn admin_request_developer_enrollment_information(
     .await?
     else {
         return error(
-            "ENROLLMENT_NOT_FOUND",
-            "Developer enrollment not found",
-            404,
+            "ENROLLMENT_STATE_INVALID",
+            "Enrollment is missing or its review state has changed",
+            409,
         );
     };
 
@@ -3397,10 +3393,7 @@ async fn admin_request_developer_enrollment_information(
         );
     }
 
-    let action_url = format!(
-        "/console/developers/edit?id={}",
-        enrollment_id,
-    );
+    let action_url = format!("/console/developers/edit?id={}", enrollment_id,);
     send_notification(
         &db,
         &enrollment.applicant_account_id,
