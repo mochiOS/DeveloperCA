@@ -12,7 +12,7 @@ use crate::model::{
 fn value(value: impl AsRef<str>) -> JsValue {
     JsValue::from_str(value.as_ref())
 }
-fn number(value: i64) -> JsValue {
+pub(crate) fn number(value: i64) -> JsValue {
     JsValue::from_f64(value as f64)
 }
 fn nullable(value_: Option<&str>) -> JsValue {

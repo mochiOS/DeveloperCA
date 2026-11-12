@@ -1,3 +1,4 @@
+use crate::store::number;
 use serde::Deserialize;
 use worker::*;
 
@@ -12,7 +13,7 @@ pub async fn enqueue(env: &Env, id: &str, mut payload: serde_json::Value) -> Res
     payload["event_id"] = id.into();
     env.d1("DB")?
         .prepare("INSERT OR IGNORE INTO admin_notification_outbox (id, payload_json, next_attempt_at) VALUES (?1, ?2, ?3)")
-        .bind(&[id.into(), serde_json::to_string(&payload)?.into(), crate::now().into()])?
+        .bind(&[id.into(), serde_json::to_string(&payload)?.into(), number(crate::now())])?
         .run().await?;
     Ok(())
 }
@@ -22,7 +23,7 @@ pub async fn enqueue(env: &Env, id: &str, mut payload: serde_json::Value) -> Res
 pub async fn drain(env: &Env) -> Result<()> {
     let db = env.d1("DB")?;
     let pending = db.prepare("SELECT id, payload_json, attempts FROM admin_notification_outbox WHERE next_attempt_at <= ?1 ORDER BY next_attempt_at, id LIMIT 10")
-        .bind(&[crate::now().into()])?.all().await?.results::<Pending>()?;
+        .bind(&[number(crate::now())])?.all().await?.results::<Pending>()?;
     if pending.is_empty() {
         return Ok(());
     }
@@ -36,7 +37,7 @@ pub async fn drain(env: &Env) -> Result<()> {
     for row in pending {
         // Conditional claim prevents simultaneous fetch and cron invocations sending a row twice.
         let claimed = db.prepare("UPDATE admin_notification_outbox SET attempts = attempts + 1, next_attempt_at = ?1 WHERE id = ?2 AND attempts = ?3 AND next_attempt_at <= ?4")
-            .bind(&[(crate::now() + 60).into(), row.id.as_str().into(), row.attempts.into(), crate::now().into()])?
+            .bind(&[number(crate::now() + 60), row.id.as_str().into(), number(row.attempts), number(crate::now())])?
             .run().await?;
         if claimed.meta()?.and_then(|meta| meta.changes).unwrap_or(0) != 1 {
             continue;
@@ -55,7 +56,7 @@ pub async fn drain(env: &Env) -> Result<()> {
         match service.fetch_request(request).await {
             Ok(response) if response.status_code() == 200 => {
                 db.prepare("DELETE FROM admin_notification_outbox WHERE id = ?1 AND attempts = ?2")
-                    .bind(&[row.id.as_str().into(), (row.attempts + 1).into()])?
+                    .bind(&[row.id.as_str().into(), number(row.attempts + 1)])?
                     .run()
                     .await?;
             }
@@ -71,7 +72,7 @@ pub async fn drain(env: &Env) -> Result<()> {
                 );
                 let delay = 60 * (1_i64 << row.attempts.min(4));
                 db.prepare("UPDATE admin_notification_outbox SET next_attempt_at = ?1 WHERE id = ?2 AND attempts = ?3")
-                    .bind(&[(crate::now() + delay.min(900)).into(), row.id.as_str().into(), (row.attempts + 1).into()])?.run().await?;
+                    .bind(&[number(crate::now() + delay.min(900)), row.id.as_str().into(), number(row.attempts + 1)])?.run().await?;
             }
         }
     }
