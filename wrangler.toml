@@ -22,6 +22,11 @@ database_name = "mochios-developer-ca"
 database_id = "4cea84e3-6120-4a62-983a-8af796a899ea"
 migrations_dir = "migrations"
 
+[[ratelimits]]
+name = "PUBLIC_RATE_LIMITER"
+namespace_id = "2002"
+simple = { limit = 300, period = 60 }
+
 [[services]]
 binding = "ADMIN_DASHBOARD"
 service = "mochios-admin-dashboard"

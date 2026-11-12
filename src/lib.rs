@@ -39,6 +39,24 @@ fn json_response<T: Serialize>(value: &T, status: u16) -> Result<Response> {
     Ok(Response::from_json(value)?.with_status(status))
 }
 
+async fn public_rate_limited(req: &Request, env: &Env, scope: &str) -> Result<Option<Response>> {
+    let Some(client) = req.headers().get("CF-Connecting-IP")? else {
+        return Ok(None);
+    };
+    if env
+        .rate_limiter("PUBLIC_RATE_LIMITER")?
+        .limit(format!("{scope}:{client}"))
+        .await?
+        .success
+    {
+        return Ok(None);
+    }
+
+    let mut response = error("RATE_LIMITED", "Too many requests", 429)?;
+    response.headers_mut().set("Retry-After", "60")?;
+    Ok(Some(response))
+}
+
 fn with_health_cors(mut response: Response) -> Result<Response> {
     let headers = response.headers_mut();
     headers.set("Access-Control-Allow-Origin", STATUS_ORIGIN)?;
@@ -66,7 +84,6 @@ fn error(code: &str, message: &str, status: u16) -> Result<Response> {
         status,
     )
 }
-
 
 async fn send_notification(
     db: &D1Database,
@@ -100,8 +117,6 @@ async fn send_notification(
         );
     }
 }
-
-
 
 fn repeat_enrollment_allowed(env: &Env) -> bool {
     env.var("ALLOW_REPEAT_ENROLLMENT_FOR_DEBUG")
@@ -879,6 +894,10 @@ fn etag_matches(header: &str, quoted_etag: &str) -> bool {
 }
 
 async fn trust_store(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    if let Some(response) = public_rate_limited(&req, &ctx.env, "trust-store").await? {
+        return Ok(response);
+    }
+
     let Some(snapshot) = store::current_trust_snapshot(&ctx.env.d1("DB")?).await? else {
         return error(
             "TRUST_SNAPSHOT_UNAVAILABLE",
@@ -895,6 +914,10 @@ async fn trust_store(req: Request, ctx: RouteContext<()>) -> Result<Response> {
 }
 
 async fn trust_store_version(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    if let Some(response) = public_rate_limited(&req, &ctx.env, "trust-store-version").await? {
+        return Ok(response);
+    }
+
     let version = match param(&ctx, "snapshot_version").parse::<i64>() {
         Ok(version) if version > 0 => version,
         _ => {
@@ -917,6 +940,10 @@ async fn trust_store_version(req: Request, ctx: RouteContext<()>) -> Result<Resp
 }
 
 async fn revocations(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    if let Some(response) = public_rate_limited(&req, &ctx.env, "revocations").await? {
+        return Ok(response);
+    }
+
     let Some(snapshot) = store::current_revocation_snapshot(&ctx.env.d1("DB")?).await? else {
         return error(
             "REVOCATION_SNAPSHOT_UNAVAILABLE",
@@ -933,6 +960,10 @@ async fn revocations(req: Request, ctx: RouteContext<()>) -> Result<Response> {
 }
 
 async fn revocations_version(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    if let Some(response) = public_rate_limited(&req, &ctx.env, "revocations-version").await? {
+        return Ok(response);
+    }
+
     let version = match param(&ctx, "snapshot_version").parse::<i64>() {
         Ok(version) if version > 0 => version,
         _ => {
@@ -958,7 +989,10 @@ async fn revocations_version(req: Request, ctx: RouteContext<()>) -> Result<Resp
     )
 }
 
-async fn certificate_status(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
+async fn certificate_status(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    if let Some(response) = public_rate_limited(&req, &ctx.env, "certificate-status").await? {
+        return Ok(response);
+    }
     let certificate_id = param(&ctx, "certificate_id");
     let Some(row) = store::certificate(&ctx.env.d1("DB")?, certificate_id).await? else {
         return error("CERTIFICATE_NOT_FOUND", "Certificate not found", 404);
@@ -1398,7 +1432,6 @@ async fn admin_review_queue(req: Request, ctx: RouteContext<()>) -> Result<Respo
     }
     let db = ctx.env.d1("DB")?;
     let developers = store::manageable_developers(&db).await?;
-    let developer_creation_requests = store::pending_creation_reviews(&db).await?;
     let rows = store::active_certificates(&db).await?;
     let mut certificates = Vec::with_capacity(rows.len());
     for row in rows {
@@ -1408,7 +1441,6 @@ async fn admin_review_queue(req: Request, ctx: RouteContext<()>) -> Result<Respo
     json_response(
         &json!({
             "developers": developers,
-            "developer_creation_requests": developer_creation_requests,
             "certificates": certificates,
         }),
         200,
@@ -2071,7 +2103,6 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let response = Router::new()
         .get_async("/health", |_, _| async { health_response() })
         .options_async("/health", |_, _| async { health_preflight() })
-        .post_async("/v1/developers", create_developer)
         .get_async("/v1/developers", list_developers)
         .get_async("/v1/cli/developers", cli_developers)
         .get_async("/v1/developers/:developer_id", get_developer)
@@ -2085,8 +2116,6 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
             "/v1/developers/:developer_id/members/:member_id",
             delete_member,
         )
-        .post_async("/v1/developer-creation-requests", create_creation_request)
-        .get_async("/v1/developer-creation-requests", list_creation_requests)
         .post_async(
             "/v1/developers/:developer_id/certificates/issue",
             issue_certificate,
@@ -2134,14 +2163,6 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/v1/admin/developers/:developer_id/restore", |req, ctx| {
             admin_set_developer_suspension(req, ctx, false)
         })
-        .post_async(
-            "/v1/admin/developer-creation-requests/:request_id/approve",
-            |req, ctx| admin_creation_review(req, ctx, "approved"),
-        )
-        .post_async(
-            "/v1/admin/developer-creation-requests/:request_id/reject",
-            |req, ctx| admin_creation_review(req, ctx, "rejected"),
-        )
         .post_async(
             "/v1/admin/certificates/:certificate_id/suspend",
             |req, ctx| admin_set_certificate_suspension(req, ctx, true),
@@ -2263,6 +2284,15 @@ mod tests {
     };
 
     #[test]
+    fn legacy_developer_creation_routes_are_not_exposed() {
+        let source = include_str!("lib.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+        assert!(!production.contains(".post_async(\"/v1/developers\", create_developer)"));
+        assert!(!production.contains(".post_async(\"/v1/developer-creation-requests\""));
+        assert!(!production.contains("/v1/admin/developer-creation-requests/:request_id/"));
+    }
+
+    #[test]
     fn certificate_display_names_are_required_and_unicode_bounded() {
         assert!(valid_certificate_display_name("Release signing"));
         assert!(valid_certificate_display_name(&"証".repeat(80)));
@@ -2320,6 +2350,8 @@ mod tests {
             include_str!("../migrations/0003_automatic_certificate_issuance.sql");
         assert!(automatic_schema.contains("Legacy pending request"));
         assert!(automatic_schema.contains("DROP TABLE developer_package_scopes"));
+        let enrollment_guard = include_str!("../migrations/0013_enrollment_account_guard.sql");
+        assert!(enrollment_guard.contains("account_id TEXT PRIMARY KEY"));
     }
 
     #[test]
@@ -2435,7 +2467,6 @@ fn valid_enrollment_input(input: &CreateDeveloperEnrollment, account_id: &str) -
         _ => false,
     }
 }
-
 
 fn valid_enrollment_update(input: &UpdateDeveloperEnrollment, account_id: &str) -> bool {
     let name = input.display_name.trim();
@@ -2585,14 +2616,8 @@ async fn add_developer_enrollment_message(
         );
     }
 
-    if !store::add_developer_enrollment_message(
-        &db,
-        enrollment_id,
-        &account_id,
-        message,
-        now(),
-    )
-    .await?
+    if !store::add_developer_enrollment_message(&db, enrollment_id, &account_id, message, now())
+        .await?
     {
         return error(
             "ENROLLMENT_MESSAGE_NOT_SAVED",
@@ -2604,7 +2629,6 @@ async fn add_developer_enrollment_message(
     let messages = store::list_developer_enrollment_messages(&db, enrollment_id).await?;
     json_response(&json!({"messages": messages}), 201)
 }
-
 
 async fn create_developer_enrollment(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let Some(account_id) = user(&req, &ctx.env).await? else {
@@ -2631,15 +2655,7 @@ async fn create_developer_enrollment(mut req: Request, ctx: RouteContext<()>) ->
     }
 
     let db = ctx.env.d1("DB")?;
-    if !repeat_enrollment_allowed(&ctx.env)
-        && store::has_developer_enrollment(&db, &account_id).await?
-    {
-        return error(
-            "ENROLLMENT_ALREADY_EXISTS",
-            "This Account has already submitted a Developer registration",
-            409,
-        );
-    }
+    let enforce_single_account = !repeat_enrollment_allowed(&ctx.env);
 
     let organization_name = input.organization_name.as_deref().map(str::trim);
 
@@ -2662,7 +2678,7 @@ async fn create_developer_enrollment(mut req: Request, ctx: RouteContext<()>) ->
         None
     };
 
-    let enrollment = store::create_developer_enrollment(
+    let enrollment = match store::create_developer_enrollment(
         &db,
         store::NewDeveloperEnrollment {
             applicant_account_id: &account_id,
@@ -2676,8 +2692,25 @@ async fn create_developer_enrollment(mut req: Request, ctx: RouteContext<()>) ->
             agreement_version: input.agreement_version.trim(),
         },
         now(),
+        enforce_single_account,
     )
-    .await?;
+    .await
+    {
+        Ok(enrollment) => enrollment,
+        Err(cause)
+            if enforce_single_account
+                && store::has_developer_enrollment(&db, &account_id)
+                    .await
+                    .unwrap_or(false) =>
+        {
+            return error(
+                "ENROLLMENT_ALREADY_EXISTS",
+                "This Account has already submitted a Developer registration",
+                409,
+            );
+        }
+        Err(cause) => return Err(cause),
+    };
 
     json_response(
         &json!({
@@ -2780,6 +2813,14 @@ async fn update_developer_enrollment(mut req: Request, ctx: RouteContext<()>) ->
             409,
         );
     };
+
+    if enrollment.state != "submitted" {
+        return error(
+            "ENROLLMENT_STATE_CHANGED",
+            "The enrollment state changed while updated information was being sent",
+            409,
+        );
+    }
 
     let messages = store::list_developer_enrollment_messages(&db, enrollment_id).await?;
 
@@ -2982,26 +3023,13 @@ async fn read_notification(req: Request, ctx: RouteContext<()>) -> Result<Respon
 
     let notification_id = param(&ctx, "notification_id");
     if notification_id.is_empty() || notification_id.len() > 80 {
-        return error(
-            "NOTIFICATION_ID_INVALID",
-            "Notification ID is invalid",
-            422,
-        );
+        return error("NOTIFICATION_ID_INVALID", "Notification ID is invalid", 422);
     }
 
-    if !store::mark_notification_read(
-        &ctx.env.d1("DB")?,
-        notification_id,
-        &account_id,
-        now(),
-    )
-    .await?
+    if !store::mark_notification_read(&ctx.env.d1("DB")?, notification_id, &account_id, now())
+        .await?
     {
-        return error(
-            "NOTIFICATION_NOT_FOUND",
-            "Notification not found",
-            404,
-        );
+        return error("NOTIFICATION_NOT_FOUND", "Notification not found", 404);
     }
 
     Ok(Response::empty()?.with_status(204))

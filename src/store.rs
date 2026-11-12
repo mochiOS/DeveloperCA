@@ -110,7 +110,6 @@ async fn all<T: DeserializeOwned>(statement: worker::D1PreparedStatement) -> Res
     statement.all().await?.results()
 }
 
-
 fn notification_statement(
     db: &D1Database,
     notification_id: &str,
@@ -198,12 +197,9 @@ pub async fn send_notification(
     .ok_or_else(|| worker::Error::RustError("notification disappeared after creation".into()))
 }
 
-pub async fn notifications(
-    db: &D1Database,
-    account_id: &str,
-) -> Result<Vec<Notification>> {
-    all(
-        db.prepare(
+pub async fn notifications(db: &D1Database, account_id: &str) -> Result<Vec<Notification>> {
+    all(db
+        .prepare(
             "SELECT
                 id,
                 account_id,
@@ -220,8 +216,7 @@ pub async fn notifications(
             ORDER BY created_at DESC, id DESC
             LIMIT 100",
         )
-        .bind(&[value(account_id)])?,
-    )
+        .bind(&[value(account_id)])?)
     .await
 }
 
@@ -234,17 +229,34 @@ pub async fn mark_notification_read(
     let result = db
         .prepare(
             "UPDATE notifications
-            SET read_at = COALESCE(read_at, ?1)
-            WHERE id = ?2 AND account_id = ?3",
+             SET read_at = ?1
+             WHERE id = ?2
+               AND account_id = ?3
+               AND read_at IS NULL",
         )
         .bind(&[number(now), value(notification_id), value(account_id)])?
         .run()
         .await?;
 
-    Ok(result
+    if result
         .meta()?
         .and_then(|metadata| metadata.changes)
-        .is_some_and(|changes| changes == 1))
+        .is_some_and(|changes| changes == 1)
+    {
+        return Ok(true);
+    }
+
+    Ok(db
+        .prepare(
+            "SELECT id
+             FROM notifications
+             WHERE id = ?1 AND account_id = ?2
+             LIMIT 1",
+        )
+        .bind(&[value(notification_id), value(account_id)])?
+        .first::<serde_json::Value>(None)
+        .await?
+        .is_some())
 }
 
 pub async fn mark_all_notifications_read(
@@ -1187,10 +1199,7 @@ pub async fn developer_enrollment(
     .await
 }
 
-pub async fn has_developer_enrollment(
-    db: &D1Database,
-    account_id: &str,
-) -> Result<bool> {
+pub async fn has_developer_enrollment(db: &D1Database, account_id: &str) -> Result<bool> {
     Ok(db
         .prepare(
             "SELECT id
@@ -1253,7 +1262,14 @@ pub async fn list_reviewable_developer_enrollments(
 				submitted_at,
 				reviewed_at,
 				created_at,
-				updated_at
+				updated_at,
+				(
+					SELECT m.author_kind
+					FROM developer_enrollment_messages m
+					WHERE m.enrollment_id = developer_enrollments.id
+					ORDER BY m.created_at DESC, m.id DESC
+					LIMIT 1
+				) AS last_message_author_kind
 			FROM developer_enrollments
 			WHERE state IN (
 				'submitted',
@@ -1285,7 +1301,6 @@ pub struct NewDeveloperEnrollment<'a> {
     pub agreement_version: &'a str,
 }
 
-
 pub struct DeveloperEnrollmentUpdate<'a> {
     pub developer_type: &'a str,
     pub organization_type: Option<&'a str>,
@@ -1302,6 +1317,7 @@ pub async fn create_developer_enrollment(
     db: &D1Database,
     input: NewDeveloperEnrollment<'_>,
     now: i64,
+    enforce_single_account: bool,
 ) -> Result<DeveloperEnrollment> {
     let enrollment_id = id(now);
 
@@ -1309,7 +1325,18 @@ pub async fn create_developer_enrollment(
         "developer_type": input.developer_type,
     }))?;
 
-    db.batch(vec![
+    let mut statements = Vec::new();
+    if enforce_single_account {
+        statements.push(
+            db.prepare(
+                "INSERT INTO developer_enrollment_account_guard (account_id, created_at)
+                 VALUES (?1, ?2)",
+            )
+            .bind(&[value(input.applicant_account_id), number(now)])?,
+        );
+    }
+
+    statements.extend([
         db.prepare(
             "INSERT INTO developer_enrollments (
 				id,
@@ -1362,8 +1389,9 @@ pub async fn create_developer_enrollment(
             value(metadata),
             number(now),
         ])?,
-    ])
-    .await?;
+    ]);
+
+    db.batch(statements).await?;
 
     developer_enrollment(db, &enrollment_id)
         .await?
@@ -1424,6 +1452,7 @@ pub async fn update_developer_enrollment_information(
                 website = ?6,
                 account_holder_account_id = ?7,
                 agreement_version = ?8,
+                state = 'submitted',
                 updated_at = ?9
              WHERE id = ?10
                AND applicant_account_id = ?11
@@ -1562,7 +1591,7 @@ pub async fn begin_developer_enrollment_review(
 				state = 'in_review',
 				updated_at = ?1
 			WHERE id = ?2
-			  AND state IN ('submitted', 'information_required')",
+			  AND state = 'submitted'",
             )
             .bind(&[number(now), value(enrollment_id)])?,
             db.prepare(
@@ -1955,13 +1984,7 @@ pub async fn add_developer_enrollment_message(
 				message,
 				created_at
 			)
-			SELECT
-				?1,
-				id,
-				?2,
-				'developer',
-				?3,
-				?4
+			SELECT ?1, id, ?2, 'developer', ?3, ?4
 			FROM developer_enrollments
 			WHERE id = ?5
 			  AND applicant_account_id = ?2
@@ -1976,7 +1999,7 @@ pub async fn add_developer_enrollment_message(
             ])?,
             db.prepare(
                 "UPDATE developer_enrollments
-                 SET updated_at = ?1
+                 SET state = 'submitted', updated_at = ?1
                  WHERE id = ?2 AND applicant_account_id = ?3
                    AND state = 'information_required' AND changes() = 1",
             )
