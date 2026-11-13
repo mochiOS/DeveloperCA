@@ -125,6 +125,51 @@ pub async fn account_is_active(account_id: &str, env: &worker::Env) -> Result<bo
     Ok(envelope.account.id == account_id && envelope.account.status == "active")
 }
 
+pub async fn account_names(
+    account_ids: &[String],
+    env: &worker::Env,
+) -> Result<Option<std::collections::HashMap<String, String>>> {
+    #[derive(Deserialize)]
+    struct Name {
+        id: String,
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct Names {
+        accounts: Vec<Name>,
+    }
+    let base = env.var("ACCOUNTS_BASE_URL")?.to_string();
+    let mut names = std::collections::HashMap::new();
+    for chunk in account_ids.chunks(100) {
+        let headers = service_headers(env)?;
+        headers.set("Content-Type", "application/json")?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(JsValue::from_str(
+                &serde_json::json!({"account_ids":chunk}).to_string(),
+            )));
+        let request = Request::new_with_init(
+            &format!("{}/v1/internal/accounts/names", base.trim_end_matches('/')),
+            &init,
+        )?;
+        let mut response = match Fetch::Request(request).send().await {
+            Ok(response) if response.status_code() == 200 => response,
+            _ => return Ok(None),
+        };
+        let result: Names = match response.json().await {
+            Ok(names) => names,
+            Err(_) => return Ok(None),
+        };
+        for name in result.accounts {
+            if chunk.contains(&name.id) {
+                names.insert(name.id, name.name);
+            }
+        }
+    }
+    Ok(Some(names))
+}
+
 async fn delegation(
     req: &Request,
     env: &worker::Env,

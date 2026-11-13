@@ -262,8 +262,28 @@ async fn list_members(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     if membership(&req, &ctx, developer_id).await?.is_none() {
         return error("FORBIDDEN", "Active membership required", 403);
     }
+    let members = store::members(&ctx.env.d1("DB")?, developer_id).await?;
+    let names = auth::account_names(
+        &members
+            .iter()
+            .map(|m| m.account_id.clone())
+            .collect::<Vec<_>>(),
+        &ctx.env,
+    )
+    .await?;
+    let rows: Vec<_> = members
+        .into_iter()
+        .map(|member| {
+            let display_name = names
+                .as_ref()
+                .and_then(|names| names.get(&member.account_id));
+            let mut row = json!(member);
+            row["display_name"] = json!(display_name);
+            row
+        })
+        .collect();
     json_response(
-        &json!({"members": store::members(&ctx.env.d1("DB")?, developer_id).await?}),
+        &json!({"members":rows,"names_available":names.is_some()}),
         200,
     )
 }

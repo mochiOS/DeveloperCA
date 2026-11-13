@@ -9,6 +9,8 @@ pub struct Developer {
     pub display_name: String,
     pub status: String,
     pub verification_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }

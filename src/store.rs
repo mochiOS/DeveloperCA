@@ -294,7 +294,7 @@ pub async fn developer(db: &D1Database, developer_id: &str) -> Result<Option<Dev
 
 pub async fn list_developers(db: &D1Database, account_id: &str) -> Result<Vec<Developer>> {
     all(db.prepare(
-        "SELECT d.id, d.certificate_developer_id, d.developer_type, d.display_name, d.status, d.verification_status, d.created_at, d.updated_at
+        "SELECT d.id, d.certificate_developer_id, d.developer_type, d.display_name, d.status, d.verification_status, d.created_at, d.updated_at, m.role
          FROM developer_members m JOIN developers d ON d.id = m.developer_id
          WHERE m.account_id = ?1 AND m.status = 'active' AND d.status != 'deleted' ORDER BY d.created_at",
     ).bind(&[value(account_id)])?).await
