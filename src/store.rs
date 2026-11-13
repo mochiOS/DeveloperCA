@@ -364,6 +364,62 @@ pub async fn members(db: &D1Database, developer_id: &str) -> Result<Vec<Member>>
     ).bind(&[value(developer_id)])?).await
 }
 
+fn member_change_records(
+    db: &D1Database,
+    member: &Member,
+    actor: &str,
+    event: &str,
+    previous: Option<&Member>,
+    now: i64,
+) -> Result<Vec<worker::D1PreparedStatement>> {
+    let audit_id = id(now);
+    let metadata = serde_json::to_string(&serde_json::json!({
+        "account_id": member.account_id, "role": member.role, "status": member.status,
+        "previous_role":previous.map(|member| &member.role),
+        "previous_status":previous.map(|member| &member.status),
+    }))?;
+    let (title, prefix, suffix) = if event == "member.added" {
+        (
+            "Added to Developer",
+            "You have been added to ",
+            format!(" as {}.", member.role),
+        )
+    } else if member.status == "removed" {
+        (
+            "Removed from Developer",
+            "Your access to ",
+            " has been removed.".to_string(),
+        )
+    } else if member.status != "active" {
+        (
+            "Team membership updated",
+            "Your membership in ",
+            format!(" is now {}.", member.status),
+        )
+    } else {
+        (
+            "Team role updated",
+            "Your role in ",
+            format!(" is now {}.", member.role),
+        )
+    };
+    let action_url = if member.status == "active" {
+        format!("/console/team?developer={}", member.developer_id)
+    } else {
+        "/console/notifications".into()
+    };
+    Ok(vec![
+        // This statement immediately follows the mutation in the same D1 transaction.
+        db.prepare("INSERT INTO audit_logs(id,developer_id,actor_account_id,event_type,metadata_json,created_at)
+            SELECT ?1,?2,?3,?4,?5,?6 WHERE changes()=1")
+            .bind(&[value(&audit_id),value(&member.developer_id),value(actor),value(event),value(metadata),number(now)])?,
+        db.prepare("INSERT INTO notifications(id,account_id,kind,title,message,action_url,source,source_id,created_at,read_at)
+            SELECT ?1,?2,'info',?3,?4||d.display_name||?5,?6,'developer_team',d.id,?7,NULL
+              FROM developers d WHERE d.id=?8 AND EXISTS(SELECT 1 FROM audit_logs WHERE id=?9)")
+            .bind(&[value(id(now)),value(&member.account_id),value(title),value(prefix),value(suffix),value(action_url),number(now),value(&member.developer_id),value(audit_id)])?,
+    ])
+}
+
 pub async fn add_member(
     db: &D1Database,
     developer_id: &str,
@@ -372,38 +428,91 @@ pub async fn add_member(
     now: i64,
     actor: &str,
 ) -> Result<Option<Member>> {
-    let member_id = id(now);
-    db.batch(vec![
-        db.prepare(
-            "INSERT INTO developer_members (id, developer_id, account_id, role, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)
-             ON CONFLICT(developer_id, account_id) DO UPDATE SET role=excluded.role, status='active', updated_at=excluded.updated_at
-             WHERE developer_members.status='removed'",
-        ).bind(&[value(&member_id), value(developer_id), value(account_id), value(role), number(now)])?,
-        audit(db, Some(developer_id), Some(actor), "member.added", now)?,
-    ]).await?;
-    db.prepare("SELECT id, developer_id, account_id, role, status, created_at, updated_at FROM developer_members WHERE developer_id=?1 AND account_id=?2")
-        .bind(&[value(developer_id), value(account_id)])?.first(None).await
+    let member = Member {
+        id: id(now),
+        developer_id: developer_id.into(),
+        account_id: account_id.into(),
+        role: role.into(),
+        status: "active".into(),
+        created_at: now,
+        updated_at: now,
+    };
+    let mut statements = vec![db.prepare(
+        "INSERT INTO developer_members(id,developer_id,account_id,role,status,created_at,updated_at)
+         SELECT ?1,?2,?3,?4,'active',?5,?5
+          WHERE EXISTS(SELECT 1 FROM developer_members actor
+             WHERE actor.developer_id=?2 AND actor.account_id=?6 AND actor.status='active'
+               AND actor.role IN ('owner','admin') AND (?4!='owner' OR actor.role='owner'))
+         ON CONFLICT(developer_id,account_id) DO UPDATE SET role=excluded.role,status='active',updated_at=excluded.updated_at
+          WHERE developer_members.status='removed'"
+    ).bind(&[value(&member.id),value(developer_id),value(account_id),value(role),number(now),value(actor)])?];
+    statements.extend(member_change_records(
+        db,
+        &member,
+        actor,
+        "member.added",
+        None,
+        now,
+    )?);
+    let results = db.batch(statements).await?;
+    if results[0].meta()?.and_then(|meta| meta.changes) != Some(1) {
+        return Ok(None);
+    }
+    member_for_account(db, developer_id, account_id).await
 }
 
 pub async fn update_member(
     db: &D1Database,
-    developer_id: &str,
-    member_id: &str,
+    target: &Member,
     role: Option<&str>,
     status: Option<&str>,
     now: i64,
     actor: &str,
 ) -> Result<Option<Member>> {
-    db.batch(vec![
+    let mut member = target.clone();
+    if let Some(role) = role {
+        member.role = role.into();
+    }
+    if let Some(status) = status {
+        member.status = status.into();
+    }
+    member.updated_at = now;
+    let event = if member.status == "removed" {
+        "member.removed"
+    } else {
+        "member.updated"
+    };
+    let mut statements = vec![
         db.prepare(
-            "UPDATE developer_members SET role=COALESCE(?1, role), status=COALESCE(?2, status), updated_at=?3
-             WHERE id=?4 AND developer_id=?5",
-        ).bind(&[nullable(role), nullable(status), number(now), value(member_id), value(developer_id)])?,
-        audit(db, Some(developer_id), Some(actor), "member.updated", now)?,
-    ]).await?;
-    db.prepare("SELECT id, developer_id, account_id, role, status, created_at, updated_at FROM developer_members WHERE id=?1 AND developer_id=?2")
-        .bind(&[value(member_id), value(developer_id)])?.first(None).await
+            "UPDATE developer_members SET role=?1,status=?2,updated_at=?3
+          WHERE id=?4 AND developer_id=?5 AND role=?6 AND status=?7 AND updated_at=?8
+            AND EXISTS(SELECT 1 FROM developer_members actor
+              WHERE actor.developer_id=?5 AND actor.account_id=?9 AND actor.status='active'
+                AND actor.role IN ('owner','admin')
+                AND ((?6!='owner' AND ?1!='owner') OR actor.role='owner'))",
+        )
+        .bind(&[
+            value(&member.role),
+            value(&member.status),
+            number(now),
+            value(&target.id),
+            value(&target.developer_id),
+            value(&target.role),
+            value(&target.status),
+            number(target.updated_at),
+            value(actor),
+        ])?,
+    ];
+    statements.extend(member_change_records(
+        db,
+        &member,
+        actor,
+        event,
+        Some(target),
+        now,
+    )?);
+    let results = db.batch(statements).await?;
+    Ok((results[0].meta()?.and_then(|meta| meta.changes) == Some(1)).then_some(member))
 }
 
 pub async fn creation_request(

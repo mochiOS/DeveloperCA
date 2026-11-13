@@ -323,7 +323,14 @@ async fn add_member(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
         &actor.account_id,
     )
     .await?;
-    json_response(&json!({"member": member}), 201)
+    match member {
+        Some(member) => json_response(&json!({"member":member}), 201),
+        None => error(
+            "MEMBER_CHANGED",
+            "Team membership changed. Refresh before retrying.",
+            409,
+        ),
+    }
 }
 
 async fn patch_member(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -355,10 +362,30 @@ async fn patch_member(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
             403,
         );
     }
+    if input.role.is_none() && input.status.is_none() {
+        return error(
+            "MEMBER_INPUT_INVALID",
+            "Choose a role or membership status",
+            422,
+        );
+    }
+    if input.role.as_deref().is_none_or(|role| role == target.role)
+        && input
+            .status
+            .as_deref()
+            .is_none_or(|status| status == target.status)
+    {
+        return json_response(&json!({"member":target}), 200);
+    }
+    if input.status.as_deref() == Some("active")
+        && target.status != "active"
+        && !auth::account_is_active(&target.account_id, &ctx.env).await?
+    {
+        return error("ACCOUNT_INACTIVE", "Target Account must be active", 422);
+    }
     let result = store::update_member(
         &ctx.env.d1("DB")?,
-        developer_id,
-        member_id,
+        &target,
         input.role.as_deref(),
         input.status.as_deref(),
         now(),
@@ -366,12 +393,13 @@ async fn patch_member(mut req: Request, ctx: RouteContext<()>) -> Result<Respons
     )
     .await;
     match result {
-        Ok(member) => json_response(&json!({"member": member}), 200),
-        Err(_) => error(
-            "LAST_OWNER_REQUIRED",
-            "Developer must retain an active owner",
+        Ok(Some(member)) => json_response(&json!({"member":member}), 200),
+        Ok(None) => error(
+            "MEMBER_CHANGED",
+            "Team membership changed. Refresh before retrying.",
             409,
         ),
+        Err(error) => member_change_error(error),
     }
 }
 
@@ -393,8 +421,7 @@ async fn delete_member(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     }
     match store::update_member(
         &ctx.env.d1("DB")?,
-        developer_id,
-        member_id,
+        &target,
         None,
         Some("removed"),
         now(),
@@ -402,12 +429,28 @@ async fn delete_member(req: Request, ctx: RouteContext<()>) -> Result<Response> 
     )
     .await
     {
-        Ok(_) => Ok(Response::empty()?.with_status(204)),
-        Err(_) => error(
+        Ok(Some(_)) => Ok(Response::empty()?.with_status(204)),
+        Ok(None) => error(
+            "MEMBER_CHANGED",
+            "Team membership changed. Refresh before retrying.",
+            409,
+        ),
+        Err(error) => member_change_error(error),
+    }
+}
+
+fn member_change_error(cause: worker::Error) -> Result<Response> {
+    if cause
+        .to_string()
+        .contains("developer must retain an active owner")
+    {
+        error(
             "LAST_OWNER_REQUIRED",
             "Developer must retain an active owner",
             409,
-        ),
+        )
+    } else {
+        Err(cause)
     }
 }
 
