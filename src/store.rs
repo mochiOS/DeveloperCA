@@ -377,7 +377,8 @@ pub async fn add_member(
         db.prepare(
             "INSERT INTO developer_members (id, developer_id, account_id, role, status, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)
-             ON CONFLICT(developer_id, account_id) DO UPDATE SET role=excluded.role, status='active', updated_at=excluded.updated_at",
+             ON CONFLICT(developer_id, account_id) DO UPDATE SET role=excluded.role, status='active', updated_at=excluded.updated_at
+             WHERE developer_members.status='removed'",
         ).bind(&[value(&member_id), value(developer_id), value(account_id), value(role), number(now)])?,
         audit(db, Some(developer_id), Some(actor), "member.added", now)?,
     ]).await?;

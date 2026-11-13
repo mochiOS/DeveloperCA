@@ -280,6 +280,17 @@ async fn add_member(mut req: Request, ctx: RouteContext<()>) -> Result<Response>
     {
         return error("FORBIDDEN", "Insufficient role for membership change", 403);
     }
+    if store::members(&ctx.env.d1("DB")?, developer_id)
+        .await?
+        .iter()
+        .any(|member| member.account_id == input.account_id)
+    {
+        return error(
+            "MEMBER_EXISTS",
+            "This Account is already a team member",
+            409,
+        );
+    }
     if !auth::account_is_active(&input.account_id, &ctx.env).await? {
         return error("ACCOUNT_INACTIVE", "Target Account must be active", 422);
     }
