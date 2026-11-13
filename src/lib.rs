@@ -3002,10 +3002,7 @@ async fn list_notifications(req: Request, ctx: RouteContext<()>) -> Result<Respo
     };
 
     let notifications = store::notifications(&ctx.env.d1("DB")?, &account_id).await?;
-    let unread_count = notifications
-        .iter()
-        .filter(|notification| notification.read_at.is_none())
-        .count();
+    let unread_count = store::unread_notification_count(&ctx.env.d1("DB")?, &account_id).await?;
 
     json_response(
         &json!({

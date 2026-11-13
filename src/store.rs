@@ -220,6 +220,18 @@ pub async fn notifications(db: &D1Database, account_id: &str) -> Result<Vec<Noti
     .await
 }
 
+pub async fn unread_notification_count(db: &D1Database, account_id: &str) -> Result<i64> {
+    Ok(db
+        .prepare(
+            "SELECT COUNT(*) AS count FROM notifications WHERE account_id=?1 AND read_at IS NULL",
+        )
+        .bind(&[value(account_id)])?
+        .first::<serde_json::Value>(None)
+        .await?
+        .and_then(|row| row.get("count").and_then(serde_json::Value::as_i64))
+        .unwrap_or(0))
+}
+
 pub async fn mark_notification_read(
     db: &D1Database,
     notification_id: &str,
